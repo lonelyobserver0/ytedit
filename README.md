@@ -77,9 +77,15 @@ pulsante Scarica.
   di Qt, quindi il video sta nella finestra anche su Wayland nativo (non è mpv
   come processo esterno agganciato con `--wid`, che richiede X11)
 - riproduzione in streaming diretta da URL, senza download preventivo
-- controlli barra OSC, pausa, stop e seek esatto (non al keyframe)
+- controlli barra OSC, pausa, stop, salti di ±5 s e seek esatto (non al keyframe)
+- **timeline** sotto il video: testina trascinabile per scorrere avanti e indietro,
+  maniglie IN/OUT per delimitare il segmento, con selezione evidenziata e durata
+  mostrata; sincronizzata in entrambi i versi con i campi IN e OUT
 - pulsanti `IN = posizione` / `OUT = posizione` che leggono il tempo dal player via IPC
 - taglio veloce (`-c copy`) o preciso (ricodifica)
+- due azioni opposte sulla selezione: **tieni solo la selezione** oppure
+  **rimuovi la selezione**, che elimina l'intervallo e ricuce le parti rimanenti
+  in un solo passaggio FFmpeg (`trim` + `concat`)
 - estrazione audio, sostituzione della traccia audio
 - scala, rotazione, volume, dissolvenze audio in entrata/uscita
 

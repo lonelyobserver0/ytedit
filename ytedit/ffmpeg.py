@@ -307,6 +307,61 @@ def transform_cmd(src, dst, width="", height="", rotate="none", volume="1.0",
     return args + encode + [str(dst)]
 
 
+def remove_section_cmd(src, dst, start, end) -> list[str]:
+    """Rimuove l'intervallo [start, end] e ricuce le due parti rimanenti.
+
+    Un solo passaggio con `trim`/`concat`: tagliare e riunire separatamente
+    costringerebbe a file intermedi e a due ricodifiche.
+    """
+    start_s = parse_timestamp(start)
+    end_s = parse_timestamp(end)
+    if end_s <= start_s:
+        raise FFmpegError("La fine della selezione deve superare l'inizio.")
+
+    info = media_info(src)
+    duration = info.duration
+    if info.probed and duration:
+        if start_s >= duration:
+            raise FFmpegError(
+                f"La selezione inizia oltre la fine del file "
+                f"({format_timestamp(duration)})."
+            )
+        end_s = min(end_s, duration)
+        if start_s <= 0 and end_s >= duration - 0.05:
+            raise FFmpegError("La selezione copre tutto il file: non resterebbe nulla.")
+
+    # Se la selezione tocca un estremo resta un solo spezzone: basta un taglio.
+    if start_s <= 0:
+        return cut_cmd(src, dst, format_timestamp(end_s),
+                       format_timestamp(duration or end_s + 1), precise=True)
+    if duration and end_s >= duration - 0.05:
+        return cut_cmd(src, dst, "0", format_timestamp(start_s), precise=True)
+
+    has_video = info.has_video or not info.probed
+    has_audio = info.has_audio or not info.probed
+    parts, labels = [], ""
+    for index, (from_s, to_s) in enumerate(
+            ((0.0, start_s), (end_s, duration or None))):
+        if has_video:
+            window = f"start={from_s:.3f}" + (f":end={to_s:.3f}" if to_s else "")
+            parts.append(f"[0:v]trim={window},setpts=PTS-STARTPTS[v{index}]")
+            labels += f"[v{index}]"
+        if has_audio:
+            window = f"start={from_s:.3f}" + (f":end={to_s:.3f}" if to_s else "")
+            parts.append(f"[0:a]atrim={window},asetpts=PTS-STARTPTS[a{index}]")
+            labels += f"[a{index}]"
+
+    concat = (f"{labels}concat=n=2:v={1 if has_video else 0}:"
+              f"a={1 if has_audio else 0}"
+              + ("[outv]" if has_video else "") + ("[outa]" if has_audio else ""))
+    args = [FFMPEG, "-y", "-i", str(src), "-filter_complex", ";".join(parts + [concat])]
+    if has_video:
+        args += ["-map", "[outv]", *video_encode_for(dst)]
+    if has_audio:
+        args += ["-map", "[outa]", *audio_encode_for(dst)]
+    return args + [str(dst)]
+
+
 def replace_audio_cmd(video, audio, dst) -> list[str]:
     return [FFMPEG, "-y", "-i", str(video), "-i", str(audio),
             "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",

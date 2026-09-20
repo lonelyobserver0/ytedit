@@ -22,9 +22,11 @@ from .downloader import AnalyzeWorker, YTDLPWorker, analyze_command, build_comma
 from .ffmpeg import (
     FFmpegError, burn_subtitles_cmd, concat_copy_cmd, concat_encode_cmd,
     cut_cmd, extract_audio_cmd, format_timestamp, media_info, mux_subtitles_cmd,
-    parse_timestamp, replace_audio_cmd, transform_cmd, write_concat_list,
+    parse_timestamp, remove_section_cmd, replace_audio_cmd, transform_cmd,
+    write_concat_list,
 )
 from .player import MPVPlayer, is_url, ytdl_path
+from .timeline import Timeline
 from . import video_widget
 from .workers import ProcessWorker
 
@@ -261,6 +263,11 @@ class MainWindow(QMainWindow):
         self.video_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         g.addWidget(self.video_frame, 1, 0, 1, 4)
 
+        self.timeline = Timeline()
+        self.timeline.seek_requested.connect(self._timeline_seek)
+        self.timeline.selection_changed.connect(self._timeline_selection)
+        g.addWidget(self.timeline, 2, 0, 1, 4)
+
         transport = QHBoxLayout()
         play = QPushButton("▶ Riproduci")
         play.clicked.connect(self.play_file)
@@ -268,6 +275,10 @@ class MainWindow(QMainWindow):
         pause.clicked.connect(self.player.toggle_pause)
         stop = QPushButton("⏹ Stop")
         stop.clicked.connect(self.stop_player)
+        back = QPushButton("⏪ −5s")
+        back.clicked.connect(lambda: self._skip(-5))
+        forward = QPushButton("+5s ⏩")
+        forward.clicked.connect(lambda: self._skip(5))
         set_in = QPushButton("IN = posizione")
         set_in.clicked.connect(lambda: self._set_time_from_player(self.in_time))
         set_out = QPushButton("OUT = posizione")
@@ -276,14 +287,14 @@ class MainWindow(QMainWindow):
         grab.setToolTip("Scarica dall'URL solo l'intervallo selezionato.")
         grab.clicked.connect(self.download_section)
         self.position_label = QLabel("--:--:--")
-        for widget in (play, pause, stop, set_in, set_out, grab):
+        for widget in (play, pause, stop, back, forward, set_in, set_out, grab):
             transport.addWidget(widget)
         transport.addWidget(self.position_label)
         transport.addStretch(1)
-        g.addLayout(transport, 2, 0, 1, 4)
+        g.addLayout(transport, 3, 0, 1, 4)
 
         self.media_info_label = QLabel("Nessun file caricato.")
-        g.addWidget(self.media_info_label, 3, 0, 1, 4)
+        g.addWidget(self.media_info_label, 4, 0, 1, 4)
 
         cutbox = QGroupBox("Taglio")
         cg = QGridLayout(cutbox)
@@ -291,15 +302,19 @@ class MainWindow(QMainWindow):
         self.out_time = QLineEdit("00:00:10")
         self.precise = QCheckBox("Taglio preciso (ricodifica)")
         self.precise.setChecked(True)
-        cut = QPushButton("✂ Taglia")
+        cut = QPushButton("✂ Tieni solo la selezione")
         cut.clicked.connect(self.cut)
+        remove = QPushButton("✀ Rimuovi la selezione")
+        remove.setToolTip("Elimina l'intervallo IN–OUT e ricuce le parti rimanenti.")
+        remove.clicked.connect(self.remove_section)
         cg.addWidget(QLabel("IN"), 0, 0)
         cg.addWidget(self.in_time, 0, 1)
         cg.addWidget(QLabel("OUT"), 1, 0)
         cg.addWidget(self.out_time, 1, 1)
         cg.addWidget(self.precise, 2, 0, 1, 2)
         cg.addWidget(cut, 3, 0, 1, 2)
-        g.addWidget(cutbox, 4, 0, 1, 2)
+        cg.addWidget(remove, 4, 0, 1, 2)
+        g.addWidget(cutbox, 5, 0, 1, 2)
 
         trans = QGroupBox("Video / Audio")
         tg = QGridLayout(trans)
@@ -324,7 +339,7 @@ class MainWindow(QMainWindow):
         transform = QPushButton("Applica trasformazioni")
         transform.clicked.connect(self.transform)
         tg.addWidget(transform, 6, 0, 1, 2)
-        g.addWidget(trans, 4, 2, 1, 2)
+        g.addWidget(trans, 5, 2, 1, 2)
 
         audio = QGroupBox("Audio")
         ag = QGridLayout(audio)
@@ -334,11 +349,13 @@ class MainWindow(QMainWindow):
         replace.clicked.connect(self.replace_audio)
         ag.addWidget(extract, 0, 0)
         ag.addWidget(replace, 0, 1)
-        g.addWidget(audio, 5, 0, 1, 4)
+        g.addWidget(audio, 6, 0, 1, 4)
 
         for widget in (self.in_time, self.out_time, self.width, self.height,
                        self.fadein, self.fadeout):
             widget.textChanged.connect(self._update_preview)
+        self.in_time.textChanged.connect(self._sync_timeline_selection)
+        self.out_time.textChanged.connect(self._sync_timeline_selection)
         self.rotate.currentTextChanged.connect(self._update_preview)
         self.volume.valueChanged.connect(self._update_preview)
         self.precise.toggled.connect(self._update_preview)
@@ -522,6 +539,7 @@ class MainWindow(QMainWindow):
             details = ["sorgente remota (streaming)"]
             if self._remote_duration:
                 details.append(f"durata {format_timestamp(self._remote_duration)}")
+                self.timeline.set_duration(self._remote_duration)
                 self.in_time.setText("00:00:00")
                 self.out_time.setText(format_timestamp(self._remote_duration))
             details.append("scarica il segmento per usare gli strumenti FFmpeg")
@@ -539,6 +557,7 @@ class MainWindow(QMainWindow):
             details.append("audio" if info.has_audio else "nessun audio")
             self.media_info_label.setText(" · ".join(details))
             if info.duration:
+                self.timeline.set_duration(info.duration)
                 self.out_time.setText(format_timestamp(info.duration))
                 self.in_time.setText("00:00:00")
         else:
@@ -574,6 +593,39 @@ class MainWindow(QMainWindow):
             candidate = src.with_name(f"{src.stem}{suffix}_{index}{suffix_ext}")
             index += 1
         return str(candidate)
+
+    @safe_slot
+    def _sync_timeline_selection(self):
+        """Campi IN/OUT → timeline (l'altro verso passa da _timeline_selection)."""
+        try:
+            start = parse_timestamp(self.in_time.text())
+            end = parse_timestamp(self.out_time.text())
+        except FFmpegError:
+            return
+        self.timeline.set_selection(start, end)
+
+    @safe_slot
+    def _timeline_selection(self, start, end):
+        """Trascinamento delle maniglie → campi IN/OUT."""
+        self.in_time.setText(format_timestamp(start))
+        self.out_time.setText(format_timestamp(end))
+
+    @safe_slot
+    def _skip(self, seconds):
+        """Salto relativo dai pulsanti di trasporto."""
+        if not self.player.is_running():
+            self.statusBar().showMessage("Nessuna riproduzione in corso")
+            return
+        self.player.seek(seconds, "relative")
+
+    @safe_slot
+    def _timeline_seek(self, seconds):
+        """Trascinamento della testina → salto nel video."""
+        if self.player.is_running():
+            self.player.seek(seconds)
+        else:
+            self.statusBar().showMessage(
+                f"Posizione {format_timestamp(seconds)} (avvia la riproduzione per vederla)")
 
     # ------------------------------------------------------------- player
 
@@ -619,6 +671,9 @@ class MainWindow(QMainWindow):
             return
         self._ipc_failures = 0
         self.position_label.setText(format_timestamp(pos))
+        if not self.timeline.duration():
+            self.timeline.set_duration(self.player.duration() or 0.0)
+        self.timeline.set_position(pos)
 
     def _set_time_from_player(self, field: QLineEdit):
         pos = self.player.time_pos()
@@ -887,6 +942,20 @@ class MainWindow(QMainWindow):
             return
         duration = parse_timestamp(self.out_time.text()) - parse_timestamp(self.in_time.text())
         self.run_ffmpeg(args, total_duration=duration, output=dst, operation="Taglio")
+
+    @safe_slot
+    def remove_section(self):
+        """Elimina l'intervallo selezionato e ricuce il resto."""
+        src = self.source_file()
+        if not src:
+            return
+        dst = self.output_path("_senza_selezione")
+        args = self._guard(lambda: remove_section_cmd(src, dst, self.in_time.text(),
+                                                      self.out_time.text()))
+        if not args:
+            return
+        self.run_ffmpeg(args, total_duration=media_info(src).duration,
+                        output=dst, operation="Rimozione selezione")
 
     def transform(self):
         src = self.source_file()
