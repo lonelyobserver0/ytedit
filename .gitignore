@@ -1,0 +1,25 @@
+# Bytecode Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ambiente virtuale (ricreato da run.sh / run.fish)
+.venv/
+venv/
+.deps-stamp
+
+# Packaging / distribuzione
+build/
+dist/
+*.egg-info/
+
+# Cache di strumenti
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editor e sistema
+.idea/
+.vscode/
+*.swp
+.DS_Store

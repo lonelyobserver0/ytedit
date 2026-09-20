@@ -1,28 +1,121 @@
+"""Finestra principale di ytEdit."""
+from __future__ import annotations
+
+import functools
+import inspect
+import shlex
+import sys
+import tempfile
+import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
-from PySide6.QtCore import Qt, QSettings
-from PySide6.QtGui import QAction
+
+from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox, QProgressBar,
     QTextEdit, QFileDialog, QListWidget, QListWidgetItem, QGroupBox,
-    QTabWidget, QDoubleSpinBox, QSpinBox, QMessageBox
+    QTabWidget, QDoubleSpinBox, QMessageBox, QSizePolicy, QFrame,
 )
-from .downloader import YTDLPWorker
+
+from .downloader import AnalyzeWorker, YTDLPWorker, analyze_command, build_command, build_format
+from .ffmpeg import (
+    FFmpegError, burn_subtitles_cmd, concat_copy_cmd, concat_encode_cmd,
+    cut_cmd, extract_audio_cmd, format_timestamp, media_info, mux_subtitles_cmd,
+    parse_timestamp, replace_audio_cmd, transform_cmd, write_concat_list,
+)
+from .player import MPVPlayer, is_url, ytdl_path
+from . import video_widget
 from .workers import ProcessWorker
-from .ffmpeg import cut_cmd, extract_audio_cmd, transform_cmd, replace_audio_cmd
-from .player import MPVPlayer
+
+QUALITIES = ["Best disponibile", "1080p", "720p", "480p", "360p"]
+CONTAINERS = ["MP4", "MKV", "WEBM"]
+AUDIO_FORMATS = ["mp3", "m4a", "opus", "flac", "wav"]
+STATUS_ICONS = {"in attesa": "⏳", "in corso": "▶", "completato": "✔",
+                "errore": "✖", "interrotto": "⏹"}
+
+
+def safe_slot(method):
+    """Uno slot non deve mai propagare eccezioni: in PySide6 abbattono l'app.
+
+    L'errore finisce nel log dell'applicazione invece che in un terminale che
+    nessuno sta guardando.
+    """
+    # Qt passa gli argomenti del segnale (es. clicked(bool), textChanged(str)):
+    # li tronchiamo alla firma del metodo, come farebbe PySide6 senza wrapper.
+    parameters = list(inspect.signature(method).parameters.values())
+    accepts_varargs = any(p.kind is p.VAR_POSITIONAL for p in parameters)
+    max_positional = sum(
+        1 for p in parameters
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ) - 1  # esclude self
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if not accepts_varargs:
+            args = args[:max_positional]
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:
+            details = traceback.format_exc()
+            if getattr(self, "log", None) is None:  # eccezione durante la costruzione
+                print(details, file=sys.stderr)
+                return None
+            self.log_line(f"✖ Errore interno in {method.__name__}:\n{details}")
+            self.statusBar().showMessage(f"Errore interno in {method.__name__}")
+            return None
+    return wrapper
+
+
+@dataclass
+class Job:
+    url: str
+    opts: dict = field(default_factory=dict)
+    status: str = "in attesa"
+    title: str = ""
+
+    def label(self) -> str:
+        return f"{STATUS_ICONS.get(self.status, '•')} {self.title or self.url}"
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ytEdit — yt-dlp + FFmpeg")
-        self.resize(1200, 800)
+        self.resize(1200, 860)
         self.settings = QSettings("ytEdit", "ytEdit")
+
         self.download_worker = None
+        self.analyze_worker = None
         self.process_worker = None
-        self.player = MPVPlayer()
+        self.video = None          # widget video integrato, se disponibile
+        if video_widget.is_available():
+            self.video = video_widget.VideoWidget(ytdl_path=ytdl_path())
+            self.player = self.video
+        else:
+            self.player = MPVPlayer(self)
+        self.player.message.connect(self.log_line)
+
+        self.jobs: list[Job] = []
+        self.active_job = None
+        self.queue_active = False
         self.current_file = None
+        self._pending_output = None
+        self._pending_op = ""
+        self._temp_files: list[Path] = []
+        self._remote_duration = 0.0
+        self._analyzed_url = ""
+        self._ipc_failures = 0
+
         self._build()
+        self._restore_settings()
+        self._update_preview()
+
+        self.position_timer = QTimer(self)
+        self.position_timer.setInterval(500)
+        self.position_timer.timeout.connect(self._update_position)
+
+    # ------------------------------------------------------------------ UI
 
     def _build(self):
         root = QWidget()
@@ -32,77 +125,165 @@ class MainWindow(QMainWindow):
         urlrow = QHBoxLayout()
         self.url = QLineEdit()
         self.url.setPlaceholderText("URL YouTube / Vimeo / sito supportato da yt-dlp…")
+        self.url.returnPressed.connect(self.analyze)
         analyze = QPushButton("Analizza")
         analyze.clicked.connect(self.analyze)
         urlrow.addWidget(self.url, 1)
         urlrow.addWidget(analyze)
         layout.addLayout(urlrow)
 
-        tabs = QTabWidget()
-        tabs.addTab(self._download_tab(), "Download")
-        tabs.addTab(self._edit_tab(), "Editor")
-        tabs.addTab(self._advanced_tab(), "Avanzato")
-        layout.addWidget(tabs, 1)
+        self.url_info = QLabel("")
+        self.url_info.setWordWrap(True)
+        layout.addWidget(self.url_info)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._download_tab(), "Download")
+        self.tabs.addTab(self._edit_tab(), "Editor")
+        self.tabs.addTab(self._tools_tab(), "Strumenti")
+        self.tabs.addTab(self._advanced_tab(), "Avanzato")
+        layout.addWidget(self.tabs, 1)
+
+        self.progress = QProgressBar()
+        layout.addWidget(self.progress)
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(180)
+        self.log.setMaximumHeight(160)
         layout.addWidget(QLabel("Log"))
         layout.addWidget(self.log)
 
+        self.statusBar().showMessage("Pronto")
+
     def _download_tab(self):
-        w = QWidget(); g = QGridLayout(w)
+        w = QWidget()
+        g = QGridLayout(w)
+
         g.addWidget(QLabel("Qualità"), 0, 0)
         self.quality = QComboBox()
-        self.quality.addItems(["Best disponibile", "1080p", "720p", "480p", "360p"])
+        self.quality.addItems(QUALITIES)
         g.addWidget(self.quality, 0, 1)
 
-        g.addWidget(QLabel("Formato"), 1, 0)
-        self.format = QComboBox()
-        self.format.addItems(["MP4", "MKV", "WEBM"])
-        g.addWidget(self.format, 1, 1)
+        g.addWidget(QLabel("Contenitore"), 1, 0)
+        self.container = QComboBox()
+        self.container.addItems(CONTAINERS)
+        g.addWidget(self.container, 1, 1)
 
-        self.audio_only = QCheckBox("Solo audio (MP3)")
-        self.subs = QCheckBox("Scarica sottotitoli")
+        self.audio_only = QCheckBox("Solo audio")
+        self.audio_format = QComboBox()
+        self.audio_format.addItems(AUDIO_FORMATS)
+        self.audio_only.toggled.connect(self._sync_download_controls)
         g.addWidget(self.audio_only, 2, 0)
-        g.addWidget(self.subs, 2, 1)
+        g.addWidget(self.audio_format, 2, 1)
+
+        self.subs = QCheckBox("Scarica sottotitoli")
+        self.sub_langs = QLineEdit("all")
+        self.sub_langs.setToolTip("Lingue separate da virgola, es. it,en — oppure 'all'")
+        self.subs.toggled.connect(self._sync_download_controls)
+        g.addWidget(self.subs, 3, 0)
+        g.addWidget(self.sub_langs, 3, 1)
+
+        self.section = QCheckBox("Solo selezione IN–OUT")
+        self.section.setToolTip(
+            "Scarica soltanto l'intervallo scelto nell'editor, senza prendere\n"
+            "tutto il video (yt-dlp --download-sections)."
+        )
+        g.addWidget(self.section, 2, 2)
+
+        self.playlist = QCheckBox("Intera playlist")
+        self.playlist.setToolTip(
+            "Spento: da un URL con '&list=' scarica solo il video indicato.\n"
+            "Acceso: scarica tutta la playlist in una sottocartella dedicata."
+        )
+        g.addWidget(self.playlist, 3, 2)
 
         self.outdir = QLineEdit(str(Path.home() / "Downloads"))
         browse = QPushButton("Sfoglia…")
         browse.clicked.connect(self.choose_dir)
-        g.addWidget(QLabel("Destinazione"), 3, 0)
-        g.addWidget(self.outdir, 3, 1)
-        g.addWidget(browse, 3, 2)
+        g.addWidget(QLabel("Destinazione"), 4, 0)
+        g.addWidget(self.outdir, 4, 1)
+        g.addWidget(browse, 4, 2)
 
         row = QHBoxLayout()
+        enqueue = QPushButton("+ Aggiungi alla coda")
+        enqueue.clicked.connect(lambda: self.enqueue(start=False))
         download = QPushButton("Scarica")
-        download.clicked.connect(self.download)
+        download.clicked.connect(lambda: self.enqueue(start=True))
         stop = QPushButton("Interrompi")
         stop.clicked.connect(self.stop_download)
-        row.addWidget(download); row.addWidget(stop)
-        g.addLayout(row, 4, 0, 1, 3)
-
-        self.progress = QProgressBar()
-        g.addWidget(self.progress, 5, 0, 1, 3)
+        row.addWidget(enqueue)
+        row.addWidget(download)
+        row.addWidget(stop)
+        g.addLayout(row, 5, 0, 1, 3)
 
         g.addWidget(QLabel("Coda"), 6, 0)
         self.queue = QListWidget()
         g.addWidget(self.queue, 7, 0, 1, 3)
+
+        queue_row = QHBoxLayout()
+        remove = QPushButton("Rimuovi selezionato")
+        remove.clicked.connect(self.remove_job)
+        clear = QPushButton("Svuota completati")
+        clear.clicked.connect(self.clear_finished_jobs)
+        queue_row.addWidget(remove)
+        queue_row.addWidget(clear)
+        queue_row.addStretch(1)
+        g.addLayout(queue_row, 8, 0, 1, 3)
+
+        for widget in (self.quality, self.container, self.audio_format):
+            widget.currentTextChanged.connect(self._update_preview)
+        for widget in (self.audio_only, self.subs, self.playlist, self.section):
+            widget.toggled.connect(self._update_preview)
+        for widget in (self.outdir, self.sub_langs):
+            widget.textChanged.connect(self._update_preview)
         return w
 
     def _edit_tab(self):
-        w = QWidget(); g = QGridLayout(w)
+        w = QWidget()
+        g = QGridLayout(w)
 
         file_row = QHBoxLayout()
         self.edit_file = QLineEdit()
+        self.edit_file.textChanged.connect(self._on_file_changed)
         browse = QPushButton("Apri…")
         browse.clicked.connect(self.choose_edit_file)
-        play = QPushButton("▶ Riproduci")
-        play.clicked.connect(self.play_file)
         file_row.addWidget(self.edit_file, 1)
         file_row.addWidget(browse)
-        file_row.addWidget(play)
         g.addLayout(file_row, 0, 0, 1, 4)
+
+        if self.video is not None:
+            self.video_frame = self.video
+        else:
+            # Ripiego: mpv come processo esterno agganciato a questa finestra.
+            self.video_frame = QFrame()
+            self.video_frame.setStyleSheet("background: #101010;")
+            self.video_frame.setAttribute(Qt.WA_NativeWindow, True)
+            self.video_frame.setMinimumHeight(260)
+        self.video_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        g.addWidget(self.video_frame, 1, 0, 1, 4)
+
+        transport = QHBoxLayout()
+        play = QPushButton("▶ Riproduci")
+        play.clicked.connect(self.play_file)
+        pause = QPushButton("⏯ Pausa")
+        pause.clicked.connect(self.player.toggle_pause)
+        stop = QPushButton("⏹ Stop")
+        stop.clicked.connect(self.stop_player)
+        set_in = QPushButton("IN = posizione")
+        set_in.clicked.connect(lambda: self._set_time_from_player(self.in_time))
+        set_out = QPushButton("OUT = posizione")
+        set_out.clicked.connect(lambda: self._set_time_from_player(self.out_time))
+        grab = QPushButton("⬇ Scarica IN–OUT")
+        grab.setToolTip("Scarica dall'URL solo l'intervallo selezionato.")
+        grab.clicked.connect(self.download_section)
+        self.position_label = QLabel("--:--:--")
+        for widget in (play, pause, stop, set_in, set_out, grab):
+            transport.addWidget(widget)
+        transport.addWidget(self.position_label)
+        transport.addStretch(1)
+        g.addLayout(transport, 2, 0, 1, 4)
+
+        self.media_info_label = QLabel("Nessun file caricato.")
+        g.addWidget(self.media_info_label, 3, 0, 1, 4)
 
         cutbox = QGroupBox("Taglio")
         cg = QGridLayout(cutbox)
@@ -112,29 +293,38 @@ class MainWindow(QMainWindow):
         self.precise.setChecked(True)
         cut = QPushButton("✂ Taglia")
         cut.clicked.connect(self.cut)
-        cg.addWidget(QLabel("IN"), 0, 0); cg.addWidget(self.in_time, 0, 1)
-        cg.addWidget(QLabel("OUT"), 1, 0); cg.addWidget(self.out_time, 1, 1)
+        cg.addWidget(QLabel("IN"), 0, 0)
+        cg.addWidget(self.in_time, 0, 1)
+        cg.addWidget(QLabel("OUT"), 1, 0)
+        cg.addWidget(self.out_time, 1, 1)
         cg.addWidget(self.precise, 2, 0, 1, 2)
         cg.addWidget(cut, 3, 0, 1, 2)
-        g.addWidget(cutbox, 1, 0, 1, 2)
+        g.addWidget(cutbox, 4, 0, 1, 2)
 
         trans = QGroupBox("Video / Audio")
         tg = QGridLayout(trans)
         self.width = QLineEdit()
+        self.width.setPlaceholderText("es. 1280 o -1")
         self.height = QLineEdit()
-        self.rotate = QComboBox(); self.rotate.addItems(["none", "90", "180", "270"])
-        self.volume = QDoubleSpinBox(); self.volume.setRange(0, 5); self.volume.setValue(1.0); self.volume.setSingleStep(.1)
+        self.height.setPlaceholderText("es. 720 o -1")
+        self.rotate = QComboBox()
+        self.rotate.addItems(["none", "90", "180", "270"])
+        self.volume = QDoubleSpinBox()
+        self.volume.setRange(0, 5)
+        self.volume.setValue(1.0)
+        self.volume.setSingleStep(.1)
         self.fadein = QLineEdit()
         self.fadeout = QLineEdit()
         for r, (name, widget) in enumerate([
-            ("Larghezza", self.width), ("Altezza", self.height),
-            ("Rotazione", self.rotate), ("Volume", self.volume),
-            ("Fade in (s)", self.fadein), ("Fade out (s)", self.fadeout)]):
-            tg.addWidget(QLabel(name), r, 0); tg.addWidget(widget, r, 1)
+                ("Larghezza", self.width), ("Altezza", self.height),
+                ("Rotazione", self.rotate), ("Volume", self.volume),
+                ("Fade in (s)", self.fadein), ("Fade out (s)", self.fadeout)]):
+            tg.addWidget(QLabel(name), r, 0)
+            tg.addWidget(widget, r, 1)
         transform = QPushButton("Applica trasformazioni")
         transform.clicked.connect(self.transform)
         tg.addWidget(transform, 6, 0, 1, 2)
-        g.addWidget(trans, 1, 2, 1, 2)
+        g.addWidget(trans, 4, 2, 1, 2)
 
         audio = QGroupBox("Audio")
         ag = QGridLayout(audio)
@@ -142,131 +332,745 @@ class MainWindow(QMainWindow):
         extract.clicked.connect(self.extract_audio)
         replace = QPushButton("Sostituisci traccia audio")
         replace.clicked.connect(self.replace_audio)
-        ag.addWidget(extract, 0, 0); ag.addWidget(replace, 0, 1)
-        g.addWidget(audio, 2, 0, 1, 4)
+        ag.addWidget(extract, 0, 0)
+        ag.addWidget(replace, 0, 1)
+        g.addWidget(audio, 5, 0, 1, 4)
+
+        for widget in (self.in_time, self.out_time, self.width, self.height,
+                       self.fadein, self.fadeout):
+            widget.textChanged.connect(self._update_preview)
+        self.rotate.currentTextChanged.connect(self._update_preview)
+        self.volume.valueChanged.connect(self._update_preview)
+        self.precise.toggled.connect(self._update_preview)
+        return w
+
+    def _tools_tab(self):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        concat = QGroupBox("Unisci file")
+        cg = QGridLayout(concat)
+        self.concat_list = QListWidget()
+        cg.addWidget(self.concat_list, 0, 0, 6, 1)
+        buttons = [
+            ("Aggiungi…", self.add_concat_files),
+            ("Rimuovi", self.remove_concat_file),
+            ("▲ Su", lambda: self.move_concat_file(-1)),
+            ("▼ Giù", lambda: self.move_concat_file(1)),
+            ("Svuota", self.concat_list.clear),
+        ]
+        for row, (text, slot) in enumerate(buttons):
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            cg.addWidget(button, row, 1)
+        self.concat_reencode = QCheckBox("Ricodifica (file con codec diversi)")
+        cg.addWidget(self.concat_reencode, 6, 0)
+        run_concat = QPushButton("Unisci")
+        run_concat.clicked.connect(self.concat)
+        cg.addWidget(run_concat, 6, 1)
+        layout.addWidget(concat)
+
+        subs = QGroupBox("Sottotitoli (sul file dell'editor)")
+        sg = QGridLayout(subs)
+        self.sub_file = QLineEdit()
+        self.sub_file.setPlaceholderText("File .srt / .ass / .vtt…")
+        pick = QPushButton("Sfoglia…")
+        pick.clicked.connect(self.choose_sub_file)
+        sg.addWidget(QLabel("Sottotitoli"), 0, 0)
+        sg.addWidget(self.sub_file, 0, 1)
+        sg.addWidget(pick, 0, 2)
+        burn = QPushButton("Masterizza nel video (burn-in)")
+        burn.clicked.connect(self.burn_subtitles)
+        mux = QPushButton("Incorpora come traccia")
+        mux.clicked.connect(self.mux_subtitles)
+        sg.addWidget(burn, 1, 1)
+        sg.addWidget(mux, 1, 2)
+        layout.addWidget(subs)
+
+        layout.addStretch(1)
         return w
 
     def _advanced_tab(self):
-        w = QWidget(); g = QVBoxLayout(w)
+        w = QWidget()
+        g = QVBoxLayout(w)
         self.extra = QTextEdit()
-        self.extra.setPlaceholderText("Argomenti extra yt-dlp, uno per riga…")
+        self.extra.setPlaceholderText("Argomenti extra yt-dlp, uno per riga (es. --cookies-from-browser firefox)")
+        self.extra.setMaximumHeight(120)
+        self.extra.textChanged.connect(self._update_preview)
         g.addWidget(QLabel("Argomenti yt-dlp"))
         g.addWidget(self.extra)
+
         self.cmd_preview = QTextEdit()
         self.cmd_preview.setReadOnly(True)
-        g.addWidget(QLabel("Anteprima comando FFmpeg"))
-        g.addWidget(self.cmd_preview)
+        self.cmd_preview.setLineWrapMode(QTextEdit.NoWrap)
+        g.addWidget(QLabel("Anteprima comandi (aggiornata in tempo reale)"))
+        g.addWidget(self.cmd_preview, 1)
+
+        row = QHBoxLayout()
+        stop_ff = QPushButton("Interrompi operazione FFmpeg")
+        stop_ff.clicked.connect(self.stop_ffmpeg)
+        row.addWidget(stop_ff)
+        row.addStretch(1)
+        g.addLayout(row)
         return w
+
+    # ------------------------------------------------------- impostazioni
+
+    def _restore_settings(self):
+        s = self.settings
+        geometry = s.value("window/geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        self.outdir.setText(s.value("download/outdir", str(Path.home() / "Downloads")))
+        self.quality.setCurrentText(s.value("download/quality", QUALITIES[0]))
+        self.container.setCurrentText(s.value("download/container", CONTAINERS[0]))
+        self.audio_format.setCurrentText(s.value("download/audio_format", AUDIO_FORMATS[0]))
+        self.sub_langs.setText(s.value("download/sub_langs", "all"))
+        self.audio_only.setChecked(s.value("download/audio_only", False, type=bool))
+        self.subs.setChecked(s.value("download/subs", False, type=bool))
+        self.playlist.setChecked(s.value("download/playlist", False, type=bool))
+        self.precise.setChecked(s.value("edit/precise", True, type=bool))
+        self.extra.setPlainText(s.value("advanced/extra", ""))
+        self._sync_download_controls()
+
+    def _save_settings(self):
+        s = self.settings
+        s.setValue("window/geometry", self.saveGeometry())
+        s.setValue("download/outdir", self.outdir.text())
+        s.setValue("download/quality", self.quality.currentText())
+        s.setValue("download/container", self.container.currentText())
+        s.setValue("download/audio_format", self.audio_format.currentText())
+        s.setValue("download/sub_langs", self.sub_langs.text())
+        s.setValue("download/audio_only", self.audio_only.isChecked())
+        s.setValue("download/subs", self.subs.isChecked())
+        s.setValue("download/playlist", self.playlist.isChecked())
+        s.setValue("edit/precise", self.precise.isChecked())
+        s.setValue("advanced/extra", self.extra.toPlainText())
+        s.sync()
+
+    def _sync_download_controls(self):
+        audio = self.audio_only.isChecked()
+        self.audio_format.setEnabled(audio)
+        self.container.setEnabled(not audio)
+        self.quality.setEnabled(not audio)
+        self.sub_langs.setEnabled(self.subs.isChecked())
+
+    # ------------------------------------------------------------- utilità
+
+    def log_line(self, text):
+        self.log.append(text)
+
+    def extra_args(self) -> list[str]:
+        args = []
+        for line in self.extra.toPlainText().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                try:
+                    args += shlex.split(line)
+                except ValueError as exc:
+                    self.log_line(f"Argomenti extra ignorati ({line}): {exc}")
+        return args
+
+    def download_options(self) -> dict:
+        return {
+            "output_dir": self.outdir.text(),
+            "fmt": build_format(self.quality.currentText()),
+            "audio_only": self.audio_only.isChecked(),
+            "subtitles": self.subs.isChecked(),
+            "container": self.container.currentText(),
+            "sub_langs": self.sub_langs.text(),
+            "audio_format": self.audio_format.currentText(),
+            "extra_args": self.extra_args(),
+            "playlist": self.playlist.isChecked(),
+            "section": self.selected_section(),
+        }
+
+    def selected_section(self):
+        """(IN, OUT) se la casella è attiva e i tempi sono validi, altrimenti None."""
+        if not self.section.isChecked():
+            return None
+        try:
+            start = parse_timestamp(self.in_time.text())
+            end = parse_timestamp(self.out_time.text())
+        except FFmpegError:
+            return None
+        if end <= start:
+            return None
+        return (format_timestamp(start), format_timestamp(end))
 
     def choose_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Cartella destinazione", self.outdir.text())
-        if d: self.outdir.setText(d)
+        if d:
+            self.outdir.setText(d)
 
     def choose_edit_file(self):
         f, _ = QFileDialog.getOpenFileName(self, "Apri media", str(Path.home()))
         if f:
             self.edit_file.setText(f)
-            self.current_file = f
+
+    def choose_sub_file(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Seleziona sottotitoli", str(Path.home()),
+                                           "Sottotitoli (*.srt *.ass *.ssa *.vtt);;Tutti i file (*)")
+        if f:
+            self.sub_file.setText(f)
+
+    @safe_slot
+    def _on_file_changed(self, path):
+        path = path.strip()
+        self.current_file = path or None
+        if is_url(path):
+            details = ["sorgente remota (streaming)"]
+            if self._remote_duration:
+                details.append(f"durata {format_timestamp(self._remote_duration)}")
+                self.in_time.setText("00:00:00")
+                self.out_time.setText(format_timestamp(self._remote_duration))
+            details.append("scarica il segmento per usare gli strumenti FFmpeg")
+            self.media_info_label.setText(" · ".join(details))
+            self._update_preview()
+            return
+        if path and Path(path).exists():
+            info = media_info(path)
+            details = []
+            if info.duration:
+                details.append(f"durata {format_timestamp(info.duration)}")
+            if info.width and info.height:
+                details.append(f"{info.width}×{info.height}")
+            details.append("video" if info.has_video else "nessun video")
+            details.append("audio" if info.has_audio else "nessun audio")
+            self.media_info_label.setText(" · ".join(details))
+            if info.duration:
+                self.out_time.setText(format_timestamp(info.duration))
+                self.in_time.setText("00:00:00")
+        else:
+            self.media_info_label.setText("Nessun file caricato.")
+        self._update_preview()
+
+    def source_file(self):
+        """Path del file locale in editor, o None (con avviso) se non utilizzabile."""
+        path = self.edit_file.text().strip()
+        if not path:
+            QMessageBox.warning(self, "ytEdit", "Seleziona prima un file nell'editor.")
+            return None
+        if is_url(path):
+            QMessageBox.information(
+                self, "ytEdit",
+                "La sorgente è un URL in streaming: gli strumenti FFmpeg lavorano su "
+                "file locali.\nUsa «⬇ Scarica IN–OUT» per ottenere il segmento, poi "
+                "ripeti l'operazione."
+            )
+            return None
+        if not Path(path).exists():
+            QMessageBox.warning(self, "ytEdit", f"File non trovato:\n{path}")
+            return None
+        return path
+
+    def output_path(self, suffix, ext=None):
+        """Mantiene l'estensione della sorgente salvo richiesta diversa."""
+        src = Path(self.edit_file.text().strip())
+        suffix_ext = ext or (src.suffix if src.suffix else ".mp4")
+        candidate = src.with_name(src.stem + suffix + suffix_ext)
+        index = 1
+        while candidate.exists():
+            candidate = src.with_name(f"{src.stem}{suffix}_{index}{suffix_ext}")
+            index += 1
+        return str(candidate)
+
+    # ------------------------------------------------------------- player
 
     def play_file(self):
-        f = self.edit_file.text().strip()
-        if f: self.player.play(f)
-
-    def analyze(self):
-        u = self.url.text().strip()
-        if not u:
+        path = self.edit_file.text().strip()
+        if not path:
+            QMessageBox.warning(self, "ytEdit", "Nessuna sorgente da riprodurre.")
             return
-        self.queue.addItem(QListWidgetItem(f"Analisi: {u}"))
-        import subprocess, sys
+        if not is_url(path) and not Path(path).exists():
+            QMessageBox.warning(self, "ytEdit", f"File non trovato:\n{path}")
+            return
         try:
-            p = subprocess.run([sys.executable, "-m", "yt_dlp", "--dump-single-json", "--skip-download", u],
-                               capture_output=True, text=True, timeout=60)
-            if p.returncode:
-                self.log.append(p.stderr)
-                return
-            import json
-            data = json.loads(p.stdout)
-            self.log.append(f"TITOLO: {data.get('title')}")
-            self.log.append(f"DURATA: {data.get('duration')} s")
-            self.log.append(f"RISOLUZIONE: {data.get('width')}x{data.get('height')}")
-            self.log.append(f"FORMATO: {data.get('ext')}")
-        except Exception as e:
-            self.log.append(str(e))
+            start = parse_timestamp(self.in_time.text())
+        except FFmpegError:
+            start = None
+        # Il widget video crea il contesto OpenGL solo quando è visibile.
+        self.tabs.setCurrentIndex(1)
+        # In anteprima non serve il 4K: lo streaming resta fluido.
+        fmt = build_format(self.quality.currentText()) if is_url(path) else None
+        if is_url(path) and self.quality.currentText() == QUALITIES[0]:
+            fmt = build_format("1080p")
+        wid = None if self.video is not None else int(self.video_frame.winId())
+        if self.player.play(path, wid=wid, start=start, ytdl_format=fmt):
+            self._ipc_failures = 0
+            self.position_timer.start()
 
-    def download(self):
-        u = self.url.text().strip()
-        if not u:
+    def stop_player(self):
+        self.position_timer.stop()
+        self.position_label.setText("--:--:--")
+        self.player.stop()
+
+    @safe_slot
+    def _update_position(self):
+        if not self.player.is_running():
+            self.position_timer.stop()
+            self.position_label.setText("--:--:--")
+            return
+        pos = self.player.time_pos()
+        if pos is None:
+            self._ipc_failures += 1
+            if self._ipc_failures >= 3:
+                self.position_timer.stop()
+            return
+        self._ipc_failures = 0
+        self.position_label.setText(format_timestamp(pos))
+
+    def _set_time_from_player(self, field: QLineEdit):
+        pos = self.player.time_pos()
+        if pos is None:
+            QMessageBox.information(self, "ytEdit",
+                                    "Nessuna riproduzione attiva da cui leggere la posizione.")
+            return
+        field.setText(format_timestamp(pos))
+
+    @safe_slot
+    def download_section(self):
+        """Scarica dall'URL solo l'intervallo IN–OUT, senza prendere tutto."""
+        source = self.edit_file.text().strip()
+        if not is_url(source):
+            QMessageBox.information(
+                self, "ytEdit",
+                "«Scarica IN–OUT» serve per una sorgente remota.\n"
+                "Per un file locale già scaricato usa «✂ Taglia» nell'editor."
+            )
+            return
+        self.section.setChecked(True)
+        if self.selected_section() is None:
+            QMessageBox.warning(self, "ytEdit",
+                                "Intervallo non valido: controlla IN e OUT.")
+            return
+        self.url.setText(source)
+        self.enqueue(start=True)
+
+    # ------------------------------------------------------------ analisi
+
+    @safe_slot
+    def analyze(self):
+        url = self.url.text().strip()
+        if not url:
+            self.log_line("Inserisci un URL prima di analizzare.")
+            self.statusBar().showMessage("Nessun URL")
+            return
+        if self.analyze_worker and self.analyze_worker.isRunning():
+            self.log_line("Analisi già in corso: attendi il termine.")
+            self.statusBar().showMessage("Analisi già in corso")
+            return
+        self.url_info.setText("Analisi in corso…")
+        self.statusBar().showMessage("Analisi in corso…")
+        playlist = self.playlist.isChecked()
+        self.log_line("$ " + shlex.join(analyze_command(url, playlist)))
+        self.analyze_worker = AnalyzeWorker(url, playlist, self)
+        self.analyze_worker.line.connect(self.log_line)
+        self.analyze_worker.result.connect(self._analyze_done)
+        self.analyze_worker.error.connect(self._analyze_failed)
+        self.analyze_worker.start()
+
+    @safe_slot
+    def _analyze_done(self, data):
+        title = data.get("title") or "(senza titolo)"
+        if data.get("_type") == "playlist":
+            entries = data.get("entries") or []
+            summary = f"Playlist: {title} · {len(entries)} elementi"
+        else:
+            duration = data.get("duration")
+            duration_text = format_timestamp(duration) if duration else "?"
+            resolution = (f"{data.get('width')}×{data.get('height')}"
+                          if data.get("width") else "?")
+            summary = f"{title} · {duration_text} · {resolution} · {data.get('ext', '?')}"
+        self.url_info.setText(summary)
+        self.log_line(f"Analisi: {summary}")
+        self.statusBar().showMessage("Analisi completata")
+
+        if data.get("_type") == "playlist":
+            return
+        # L'URL diventa la sorgente dell'editor: si guarda in streaming e si
+        # sceglie il segmento prima di scaricare qualsiasi cosa.
+        self._remote_duration = float(data.get("duration") or 0.0)
+        self._analyzed_url = self.analyze_worker.url if self.analyze_worker else ""
+        self.edit_file.setText(self._analyzed_url)
+        self.tabs.setCurrentIndex(1)
+        if self.player.available():
+            self.play_file()
+        else:
+            self.log_line("mpv non disponibile: anteprima in streaming non possibile.")
+
+    @safe_slot
+    def _analyze_failed(self, message):
+        self.url_info.setText("Analisi fallita.")
+        self.log_line(f"ERRORE analisi: {message}")
+        self.statusBar().showMessage("Analisi fallita")
+
+    # --------------------------------------------------------------- coda
+
+    def enqueue(self, start=True):
+        url = self.url.text().strip()
+        if not url:
             QMessageBox.warning(self, "ytEdit", "Inserisci un URL.")
             return
-        fmt = "bestvideo+bestaudio/best"
-        if self.quality.currentText() == "1080p":
-            fmt = "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
-        elif self.quality.currentText() == "720p":
-            fmt = "bestvideo[height<=720]+bestaudio/best[height<=720]"
-        elif self.quality.currentText() == "480p":
-            fmt = "bestvideo[height<=480]+bestaudio/best[height<=480]"
-        elif self.quality.currentText() == "360p":
-            fmt = "bestvideo[height<=360]+bestaudio/best[height<=360]"
-        self.download_worker = YTDLPWorker(u, self.outdir.text(), fmt,
-                                           self.audio_only.isChecked(), self.subs.isChecked())
-        self.download_worker.line.connect(self.log.append)
-        self.download_worker.result.connect(lambda x: self.download_done(x))
-        self.download_worker.error.connect(lambda x: self.log.append("ERRORE:\n" + x))
+        outdir = Path(self.outdir.text().strip())
+        try:
+            outdir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "ytEdit", f"Cartella di destinazione non utilizzabile:\n{exc}")
+            return
+        job = Job(url=url, opts=self.download_options())
+        self.jobs.append(job)
+        self._refresh_queue()
+        self.url.clear()
+        self.url_info.clear()
+        if start:
+            self.queue_active = True
+            self._start_next()
+        else:
+            self.statusBar().showMessage(f"In coda: {len(self.jobs)} elementi")
+
+    def _refresh_queue(self):
+        self.queue.clear()
+        for job in self.jobs:
+            self.queue.addItem(QListWidgetItem(job.label()))
+
+    def remove_job(self):
+        row = self.queue.currentRow()
+        if row < 0 or row >= len(self.jobs):
+            return
+        if self.jobs[row] is self.active_job:
+            QMessageBox.information(self, "ytEdit", "Interrompi il download prima di rimuoverlo.")
+            return
+        self.jobs.pop(row)
+        self._refresh_queue()
+
+    def clear_finished_jobs(self):
+        self.jobs = [j for j in self.jobs if j.status in ("in attesa", "in corso")]
+        self._refresh_queue()
+
+    def _start_next(self):
+        if not self.queue_active:
+            return
+        if self.download_worker and self.download_worker.isRunning():
+            return
+        job = next((j for j in self.jobs if j.status == "in attesa"), None)
+        if job is None:
+            self.active_job = None
+            self.statusBar().showMessage("Coda completata")
+            return
+
+        job.status = "in corso"
+        self.active_job = job
+        self._refresh_queue()
+        self.progress.setValue(0)
+        self.statusBar().showMessage(f"Download: {job.url}")
+
+        self.download_worker = YTDLPWorker(url=job.url, parent=self, **job.opts)
+        self.download_worker.line.connect(self.log_line)
+        self.download_worker.progress.connect(self.progress.setValue)
+        self.download_worker.filepath.connect(self._downloaded_file)
+        self.download_worker.result.connect(self._download_done)
+        self.download_worker.error.connect(self._download_failed)
         self.download_worker.start()
 
-    def download_done(self, text):
+    @safe_slot
+    def _downloaded_file(self, path):
+        if path and Path(path).exists():
+            self.edit_file.setText(path)
+            if self.active_job and not self.active_job.title:
+                self.active_job.title = Path(path).name
+                self._refresh_queue()
+
+    @safe_slot
+    def _download_done(self, path):
         self.progress.setValue(100)
-        self.log.append("Download completato.")
-        for line in reversed(text.splitlines()):
-            if line.strip().startswith("/") and Path(line.strip()).exists():
-                self.edit_file.setText(line.strip())
-                self.current_file = line.strip()
-                break
+        self.log_line("Download completato.")
+        if self.active_job:
+            self.active_job.status = "completato"
+            if path:
+                self.active_job.title = Path(path).name
+        self._refresh_queue()
+        self._start_next()
+
+    @safe_slot
+    def _download_failed(self, message):
+        self.log_line(f"ERRORE download:\n{message}")
+        if self.active_job:
+            self.active_job.status = "interrotto" if not self.queue_active else "errore"
+        self._refresh_queue()
+        self._start_next()
 
     def stop_download(self):
-        if self.download_worker:
+        self.queue_active = False
+        if self.download_worker and self.download_worker.isRunning():
             self.download_worker.stop()
+        for job in self.jobs:
+            if job.status == "in attesa":
+                job.status = "interrotto"
+        self._refresh_queue()
+        self.statusBar().showMessage("Coda interrotta")
 
-    def run_ffmpeg(self, args):
-        self.cmd_preview.setPlainText(" ".join(f'"{a}"' if " " in a else a for a in args))
-        self.process_worker = ProcessWorker(args)
-        self.process_worker.output.connect(self.log.append)
+    # ------------------------------------------------------------- FFmpeg
+
+    def _busy(self) -> bool:
+        if self.process_worker and self.process_worker.isRunning():
+            QMessageBox.information(self, "ytEdit", "Un'operazione FFmpeg è già in corso.")
+            return True
+        return False
+
+    def run_ffmpeg(self, args, total_duration=0.0, output=None, operation=""):
+        if self._busy():
+            return
+        self._pending_output = output
+        self._pending_op = operation or "Operazione"
+        self.cmd_preview.setPlainText(self._render_command(args))
+        self.log_line(f"$ {shlex.join(str(a) for a in args)}")
+        self.progress.setValue(0)
+        self.statusBar().showMessage(f"{self._pending_op} in corso…")
+
+        self.process_worker = ProcessWorker(args, total_duration=total_duration, parent=self)
+        self.process_worker.output.connect(self.log_line)
         self.process_worker.progress.connect(self.progress.setValue)
+        self.process_worker.finished_ok.connect(self._ffmpeg_finished)
         self.process_worker.start()
 
-    def output_path(self, suffix):
-        src = Path(self.edit_file.text())
-        return str(src.with_name(src.stem + suffix + ".mp4"))
+    @safe_slot
+    def _ffmpeg_finished(self, code, last_line):
+        self._cleanup_temp_files()
+        if code == 0:
+            self.progress.setValue(100)
+            output = self._pending_output
+            self.log_line(f"✔ {self._pending_op} completata: {output or ''}")
+            self.statusBar().showMessage(f"{self._pending_op} completata")
+            if output and Path(output).exists():
+                self.edit_file.setText(output)
+        elif code == -2:
+            self.log_line("⏹ Operazione interrotta.")
+            self.statusBar().showMessage("Operazione interrotta")
+        else:
+            self.log_line(f"✖ {self._pending_op} fallita (codice {code}): {last_line}")
+            self.statusBar().showMessage(f"{self._pending_op} fallita")
+            QMessageBox.warning(self, "ytEdit",
+                                f"{self._pending_op} fallita (codice {code}).\n\n{last_line}")
+        self._pending_output = None
+
+    def stop_ffmpeg(self):
+        if self.process_worker and self.process_worker.isRunning():
+            self.process_worker.stop()
+
+    def _cleanup_temp_files(self):
+        for path in self._temp_files:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        self._temp_files.clear()
+
+    def _guard(self, build):
+        """Esegue un builder di comandi mostrando gli errori di configurazione."""
+        try:
+            return build()
+        except FFmpegError as exc:
+            QMessageBox.warning(self, "ytEdit", str(exc))
+        except OSError as exc:
+            QMessageBox.warning(self, "ytEdit", str(exc))
+        return None
 
     def cut(self):
-        src = self.edit_file.text().strip()
-        if not src: return
+        src = self.source_file()
+        if not src:
+            return
         dst = self.output_path("_cut")
-        args = cut_cmd(src, dst, self.in_time.text(), self.out_time.text(), self.precise.isChecked())
-        self.run_ffmpeg(args)
+        args = self._guard(lambda: cut_cmd(src, dst, self.in_time.text(),
+                                           self.out_time.text(), self.precise.isChecked()))
+        if not args:
+            return
+        duration = parse_timestamp(self.out_time.text()) - parse_timestamp(self.in_time.text())
+        self.run_ffmpeg(args, total_duration=duration, output=dst, operation="Taglio")
 
     def transform(self):
-        src = self.edit_file.text().strip()
-        if not src: return
+        src = self.source_file()
+        if not src:
+            return
         dst = self.output_path("_edited")
-        args = transform_cmd(src, dst, self.width.text(), self.height.text(),
-                             self.rotate.currentText(), str(self.volume.value()),
-                             self.fadein.text(), self.fadeout.text())
-        self.run_ffmpeg(args)
+        args = self._guard(lambda: transform_cmd(
+            src, dst, self.width.text(), self.height.text(), self.rotate.currentText(),
+            str(self.volume.value()), self.fadein.text(), self.fadeout.text()))
+        if not args:
+            return
+        self.run_ffmpeg(args, total_duration=media_info(src).duration,
+                        output=dst, operation="Trasformazione")
 
     def extract_audio(self):
-        src = self.edit_file.text().strip()
-        if not src: return
-        dst, _ = QFileDialog.getSaveFileName(self, "Salva audio", str(Path(src).with_suffix(".flac")),
-                                             "FLAC (*.flac);;MP3 (*.mp3);;WAV (*.wav)")
-        if not dst: return
+        src = self.source_file()
+        if not src:
+            return
+        dst, _ = QFileDialog.getSaveFileName(
+            self, "Salva audio", str(Path(src).with_suffix(".flac")),
+            "FLAC (*.flac);;MP3 (*.mp3);;WAV (*.wav);;M4A (*.m4a);;Opus (*.opus)")
+        if not dst:
+            return
         codec = Path(dst).suffix.lower().lstrip(".")
-        self.run_ffmpeg(extract_audio_cmd(src, dst, codec))
+        args = self._guard(lambda: extract_audio_cmd(src, dst, codec))
+        if args:
+            self.run_ffmpeg(args, total_duration=media_info(src).duration,
+                            output=None, operation="Estrazione audio")
 
     def replace_audio(self):
-        video = self.edit_file.text().strip()
-        if not video: return
+        video = self.source_file()
+        if not video:
+            return
         audio, _ = QFileDialog.getOpenFileName(self, "Seleziona audio", str(Path.home()))
-        if not audio: return
+        if not audio:
+            return
         dst = self.output_path("_newaudio")
-        self.run_ffmpeg(replace_audio_cmd(video, audio, dst))
+        args = self._guard(lambda: replace_audio_cmd(video, audio, dst))
+        if args:
+            self.run_ffmpeg(args, total_duration=media_info(video).duration,
+                            output=dst, operation="Sostituzione audio")
+
+    # --------------------------------------------------------- sottotitoli
+
+    def burn_subtitles(self):
+        src = self.source_file()
+        if not src:
+            return
+        sub = self.sub_file.text().strip()
+        if not sub:
+            QMessageBox.warning(self, "ytEdit", "Seleziona un file di sottotitoli.")
+            return
+        dst = self.output_path("_sub")
+        args = self._guard(lambda: burn_subtitles_cmd(src, sub, dst))
+        if args:
+            self.run_ffmpeg(args, total_duration=media_info(src).duration,
+                            output=dst, operation="Masterizzazione sottotitoli")
+
+    def mux_subtitles(self):
+        src = self.source_file()
+        if not src:
+            return
+        sub = self.sub_file.text().strip()
+        if not sub:
+            QMessageBox.warning(self, "ytEdit", "Seleziona un file di sottotitoli.")
+            return
+        dst = self.output_path("_subbed", ext=".mkv")
+        args = self._guard(lambda: mux_subtitles_cmd(src, sub, dst))
+        if args:
+            self.run_ffmpeg(args, total_duration=media_info(src).duration,
+                            output=dst, operation="Incorporazione sottotitoli")
+
+    # --------------------------------------------------------------- unione
+
+    def add_concat_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Seleziona i file da unire", str(Path.home()))
+        for f in files:
+            self.concat_list.addItem(QListWidgetItem(f))
+
+    def remove_concat_file(self):
+        row = self.concat_list.currentRow()
+        if row >= 0:
+            self.concat_list.takeItem(row)
+
+    def move_concat_file(self, delta):
+        row = self.concat_list.currentRow()
+        target = row + delta
+        if row < 0 or not (0 <= target < self.concat_list.count()):
+            return
+        item = self.concat_list.takeItem(row)
+        self.concat_list.insertItem(target, item)
+        self.concat_list.setCurrentRow(target)
+
+    def concat_files(self) -> list[str]:
+        return [self.concat_list.item(i).text() for i in range(self.concat_list.count())]
+
+    def concat(self):
+        paths = self.concat_files()
+        if len(paths) < 2:
+            QMessageBox.warning(self, "ytEdit", "Aggiungi almeno due file da unire.")
+            return
+        missing = [p for p in paths if not Path(p).exists()]
+        if missing:
+            QMessageBox.warning(self, "ytEdit", "File non trovati:\n" + "\n".join(missing))
+            return
+
+        default = str(Path(paths[0]).with_name(Path(paths[0]).stem + "_unito" + Path(paths[0]).suffix))
+        dst, _ = QFileDialog.getSaveFileName(self, "Salva file unito", default)
+        if not dst:
+            return
+
+        if self.concat_reencode.isChecked():
+            args = self._guard(lambda: concat_encode_cmd(paths, dst))
+        else:
+            handle = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+            handle.close()
+            list_path = Path(handle.name)
+            self._temp_files.append(list_path)
+            args = self._guard(lambda: concat_copy_cmd(write_concat_list(paths, list_path), dst))
+        if not args:
+            self._cleanup_temp_files()
+            return
+        total = sum(media_info(p).duration for p in paths)
+        self.run_ffmpeg(args, total_duration=total, output=dst, operation="Unione")
+
+    # ---------------------------------------------------------- anteprima
+
+    @staticmethod
+    def _render_command(args) -> str:
+        return shlex.join(str(a) for a in args)
+
+    @safe_slot
+    def _update_preview(self):
+        if not hasattr(self, "cmd_preview"):
+            return
+        blocks = []
+
+        url = self.url.text().strip() or "<URL>"
+        blocks.append("# yt-dlp\n"
+                      + self._render_command(build_command(url, **self.download_options())))
+
+        src = self.edit_file.text().strip()
+        if is_url(src):
+            section = self.selected_section()
+            blocks.append("# editor\n⚠ Sorgente remota in streaming: gli strumenti FFmpeg "
+                          "lavorano su file locali.\n"
+                          + (f"Selezione attiva: {section[0]} → {section[1]}."
+                             if section else
+                             "Attiva «Solo selezione IN–OUT» per scaricare solo il segmento."))
+        elif src:
+            for title, build in (
+                ("taglio", lambda: cut_cmd(src, self.output_path("_cut"), self.in_time.text(),
+                                           self.out_time.text(), self.precise.isChecked())),
+                ("trasformazione", lambda: transform_cmd(
+                    src, self.output_path("_edited"), self.width.text(), self.height.text(),
+                    self.rotate.currentText(), str(self.volume.value()),
+                    self.fadein.text(), self.fadeout.text())),
+            ):
+                try:
+                    blocks.append(f"# {title}\n" + self._render_command(build()))
+                except FFmpegError as exc:
+                    blocks.append(f"# {title}\n⚠ {exc}")
+                except OSError as exc:
+                    blocks.append(f"# {title}\n⚠ {exc}")
+        else:
+            blocks.append("# editor\n⚠ Nessun file selezionato nell'editor.")
+
+        self.cmd_preview.setPlainText("\n\n".join(blocks))
+
+    # ------------------------------------------------------------ chiusura
+
+    def closeEvent(self, event):
+        self.queue_active = False
+        self.position_timer.stop()
+        for worker in (self.download_worker, self.process_worker):
+            if worker and worker.isRunning():
+                worker.stop()
+                worker.wait(5000)
+        if self.analyze_worker and self.analyze_worker.isRunning():
+            self.analyze_worker.stop()
+            self.analyze_worker.wait(3000)
+        self.player.stop()
+        if self.video is not None:
+            self.video.shutdown()
+        self._cleanup_temp_files()
+        self._save_settings()
+        super().closeEvent(event)
