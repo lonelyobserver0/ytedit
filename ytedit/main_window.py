@@ -11,14 +11,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings, QTimer
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QApplication, QMainWindow, QSplitter, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox, QProgressBar,
     QTextEdit, QFileDialog, QListWidget, QListWidgetItem, QGroupBox,
     QTabWidget, QDoubleSpinBox, QMessageBox, QSizePolicy, QFrame,
 )
 
-from .downloader import AnalyzeWorker, YTDLPWorker, analyze_command, build_command, build_format
+from .downloader import (
+    KEEP_ORIGINAL, AnalyzeWorker, YTDLPWorker, analyze_command, audio_format_value,
+    build_command, build_format,
+)
 from .ffmpeg import (
     FFmpegError, burn_subtitles_cmd, concat_copy_cmd, concat_encode_cmd,
     cut_cmd, extract_audio_cmd, format_timestamp, media_info, mux_subtitles_cmd,
@@ -27,12 +31,14 @@ from .ffmpeg import (
 )
 from .player import MPVPlayer, is_url, ytdl_path
 from .timeline import Timeline
+from . import theme
 from . import video_widget
+from .video_widget import AspectBox
 from .workers import ProcessWorker
 
 QUALITIES = ["Best disponibile", "1080p", "720p", "480p", "360p"]
 CONTAINERS = ["MP4", "MKV", "WEBM"]
-AUDIO_FORMATS = ["mp3", "m4a", "opus", "flac", "wav"]
+AUDIO_FORMATS = [KEEP_ORIGINAL, "opus", "m4a", "mp3", "flac", "wav"]
 STATUS_ICONS = {"in attesa": "⏳", "in corso": "▶", "completato": "✔",
                 "errore": "✖", "interrotto": "⏹"}
 
@@ -123,12 +129,15 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
+        layout.setContentsMargins(14, 12, 14, 10)
+        layout.setSpacing(10)
 
         urlrow = QHBoxLayout()
         self.url = QLineEdit()
         self.url.setPlaceholderText("URL YouTube / Vimeo / sito supportato da yt-dlp…")
         self.url.returnPressed.connect(self.analyze)
         analyze = QPushButton("Analizza")
+        analyze.setObjectName("accent")
         analyze.clicked.connect(self.analyze)
         urlrow.addWidget(self.url, 1)
         urlrow.addWidget(analyze)
@@ -136,6 +145,7 @@ class MainWindow(QMainWindow):
 
         self.url_info = QLabel("")
         self.url_info.setWordWrap(True)
+        self.url_info.setObjectName("sectionLabel")
         layout.addWidget(self.url_info)
 
         self.tabs = QTabWidget()
@@ -150,11 +160,20 @@ class MainWindow(QMainWindow):
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(160)
-        layout.addWidget(QLabel("Log"))
+        self.log.setMaximumHeight(150)
+        self.log.setFont(theme.mono_font(9))
+        etichetta_log = QLabel("Log")
+        etichetta_log.setObjectName("sectionLabel")
+        layout.addWidget(etichetta_log)
         layout.addWidget(self.log)
 
         self.statusBar().showMessage("Pronto")
+
+    @staticmethod
+    def _section_label(testo):
+        etichetta = QLabel(testo)
+        etichetta.setObjectName("sectionLabel")
+        return etichetta
 
     def _download_tab(self):
         w = QWidget()
@@ -173,6 +192,11 @@ class MainWindow(QMainWindow):
         self.audio_only = QCheckBox("Solo audio")
         self.audio_format = QComboBox()
         self.audio_format.addItems(AUDIO_FORMATS)
+        self.audio_format.setToolTip(
+            "«originale» tiene il flusso audio così com'è, senza ricodificarlo:\n"
+            "è la qualità migliore possibile e anche il file più piccolo.\n"
+            "Gli altri formati ricodificano, quindi perdono qualcosa."
+        )
         self.audio_only.toggled.connect(self._sync_download_controls)
         g.addWidget(self.audio_only, 2, 0)
         g.addWidget(self.audio_format, 2, 1)
@@ -209,6 +233,7 @@ class MainWindow(QMainWindow):
         enqueue = QPushButton("+ Aggiungi alla coda")
         enqueue.clicked.connect(lambda: self.enqueue(start=False))
         download = QPushButton("Scarica")
+        download.setObjectName("primary")
         download.clicked.connect(lambda: self.enqueue(start=True))
         stop = QPushButton("Interrompi")
         stop.clicked.connect(self.stop_download)
@@ -217,7 +242,7 @@ class MainWindow(QMainWindow):
         row.addWidget(stop)
         g.addLayout(row, 5, 0, 1, 3)
 
-        g.addWidget(QLabel("Coda"), 6, 0)
+        g.addWidget(self._section_label("Coda"), 6, 0)
         self.queue = QListWidget()
         g.addWidget(self.queue, 7, 0, 1, 3)
 
@@ -240,8 +265,15 @@ class MainWindow(QMainWindow):
         return w
 
     def _edit_tab(self):
+        """Due colonne: a sinistra si decide, a destra si guarda.
+
+        Lo splitter lascia all'utente la proporzione fra le due: chi monta a
+        occhio allarga il visore, chi lavora sui parametri lo stringe.
+        """
         w = QWidget()
-        g = QGridLayout(w)
+        root = QVBoxLayout(w)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(8)
 
         file_row = QHBoxLayout()
         self.edit_file = QLineEdit()
@@ -250,25 +282,120 @@ class MainWindow(QMainWindow):
         browse.clicked.connect(self.choose_edit_file)
         file_row.addWidget(self.edit_file, 1)
         file_row.addWidget(browse)
-        g.addLayout(file_row, 0, 0, 1, 4)
+        root.addLayout(file_row)
+
+        self.editor_splitter = QSplitter(Qt.Horizontal)
+        self.editor_splitter.setChildrenCollapsible(False)
+        self.editor_splitter.addWidget(self._edit_controls())
+        self.editor_splitter.addWidget(self._edit_viewer())
+        self.editor_splitter.setStretchFactor(0, 0)
+        self.editor_splitter.setStretchFactor(1, 1)
+        self.editor_splitter.setSizes([420, 620])
+        self.editor_splitter.splitterMoved.connect(self._save_splitter)
+        root.addWidget(self.editor_splitter, 1)
+        return w
+
+    def _edit_controls(self):
+        """Colonna sinistra: taglio, trasformazioni, audio."""
+        pannello = QWidget()
+        layout = QVBoxLayout(pannello)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        cutbox = QGroupBox("Taglio")
+        cg = QGridLayout(cutbox)
+        self.in_time = QLineEdit("00:00:00")
+        self.out_time = QLineEdit("00:00:10")
+        for campo in (self.in_time, self.out_time):
+            campo.setFont(theme.mono_font(10))
+        self.precise = QCheckBox("Taglio preciso (ricodifica)")
+        self.precise.setChecked(True)
+        cut = QPushButton("✂ Tieni solo la selezione")
+        cut.clicked.connect(self.cut)
+        remove = QPushButton("✀ Rimuovi la selezione")
+        remove.setObjectName("danger")
+        remove.setToolTip("Elimina l'intervallo IN–OUT e ricuce le parti rimanenti.")
+        remove.clicked.connect(self.remove_section)
+        cg.addWidget(QLabel("IN"), 0, 0)
+        cg.addWidget(self.in_time, 0, 1)
+        cg.addWidget(QLabel("OUT"), 1, 0)
+        cg.addWidget(self.out_time, 1, 1)
+        cg.addWidget(self.precise, 2, 0, 1, 2)
+        cg.addWidget(cut, 3, 0, 1, 2)
+        cg.addWidget(remove, 4, 0, 1, 2)
+        layout.addWidget(cutbox)
+
+        trans = QGroupBox("Video / Audio")
+        tg = QGridLayout(trans)
+        self.scale_width = QLineEdit()
+        self.scale_width.setPlaceholderText("es. 1280 o -1")
+        self.scale_height = QLineEdit()
+        self.scale_height.setPlaceholderText("es. 720 o -1")
+        self.rotate = QComboBox()
+        self.rotate.addItems(["none", "90", "180", "270"])
+        self.volume = QDoubleSpinBox()
+        self.volume.setRange(0, 5)
+        self.volume.setValue(1.0)
+        self.volume.setSingleStep(.1)
+        self.fadein = QLineEdit()
+        self.fadeout = QLineEdit()
+        for r, (name, widget) in enumerate([
+                ("Larghezza", self.scale_width), ("Altezza", self.scale_height),
+                ("Rotazione", self.rotate), ("Volume", self.volume),
+                ("Fade in (s)", self.fadein), ("Fade out (s)", self.fadeout)]):
+            tg.addWidget(QLabel(name), r, 0)
+            tg.addWidget(widget, r, 1)
+        transform = QPushButton("Applica trasformazioni")
+        transform.clicked.connect(self.transform)
+        tg.addWidget(transform, 6, 0, 1, 2)
+        layout.addWidget(trans)
+
+        audio = QGroupBox("Audio")
+        ag = QGridLayout(audio)
+        extract = QPushButton("Estrai audio")
+        extract.clicked.connect(self.extract_audio)
+        replace = QPushButton("Sostituisci traccia audio")
+        replace.clicked.connect(self.replace_audio)
+        ag.addWidget(extract, 0, 0)
+        ag.addWidget(replace, 0, 1)
+        layout.addWidget(audio)
+        layout.addStretch(1)
+
+        for widget in (self.in_time, self.out_time, self.scale_width, self.scale_height,
+                       self.fadein, self.fadeout):
+            widget.textChanged.connect(self._update_preview)
+        self.in_time.textChanged.connect(self._sync_timeline_selection)
+        self.out_time.textChanged.connect(self._sync_timeline_selection)
+        self.rotate.currentTextChanged.connect(self._update_preview)
+        self.volume.valueChanged.connect(self._update_preview)
+        self.precise.toggled.connect(self._update_preview)
+        return pannello
+
+    def _edit_viewer(self):
+        """Colonna destra: il video, la sua barra e i comandi che lo guidano."""
+        pannello = QWidget()
+        layout = QVBoxLayout(pannello)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
 
         if self.video is not None:
+            self.video.setObjectName("viewer")
             self.video_frame = self.video
         else:
             # Ripiego: mpv come processo esterno agganciato a questa finestra.
             self.video_frame = QFrame()
-            self.video_frame.setStyleSheet("background: #101010;")
+            self.video_frame.setObjectName("viewer")
             self.video_frame.setAttribute(Qt.WA_NativeWindow, True)
-            self.video_frame.setMinimumHeight(260)
-        self.video_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        g.addWidget(self.video_frame, 1, 0, 1, 4)
+        self.viewer_box = AspectBox(self.video_frame)
+        layout.addWidget(self.viewer_box, 1)
 
         self.timeline = Timeline()
         self.timeline.seek_requested.connect(self._timeline_seek)
         self.timeline.selection_changed.connect(self._timeline_selection)
-        g.addWidget(self.timeline, 2, 0, 1, 4)
+        layout.addWidget(self.timeline)
 
-        transport = QHBoxLayout()
+        self.position_label = QLabel("--:--:--")
+        self.position_label.setFont(theme.mono_font(10, QFont.Medium))
         play = QPushButton("▶ Riproduci")
         play.clicked.connect(self.play_file)
         pause = QPushButton("⏯ Pausa")
@@ -279,87 +406,32 @@ class MainWindow(QMainWindow):
         back.clicked.connect(lambda: self._skip(-5))
         forward = QPushButton("+5s ⏩")
         forward.clicked.connect(lambda: self._skip(5))
+        trasporto = QHBoxLayout()
+        for widget in (play, pause, stop, back, forward):
+            trasporto.addWidget(widget)
+        trasporto.addStretch(1)
+        trasporto.addWidget(self.position_label)
+        layout.addLayout(trasporto)
+
         set_in = QPushButton("IN = posizione")
         set_in.clicked.connect(lambda: self._set_time_from_player(self.in_time))
         set_out = QPushButton("OUT = posizione")
         set_out.clicked.connect(lambda: self._set_time_from_player(self.out_time))
         grab = QPushButton("⬇ Scarica IN–OUT")
+        grab.setObjectName("primary")
         grab.setToolTip("Scarica dall'URL solo l'intervallo selezionato.")
         grab.clicked.connect(self.download_section)
-        self.position_label = QLabel("--:--:--")
-        for widget in (play, pause, stop, back, forward, set_in, set_out, grab):
-            transport.addWidget(widget)
-        transport.addWidget(self.position_label)
-        transport.addStretch(1)
-        g.addLayout(transport, 3, 0, 1, 4)
+        marcatura = QHBoxLayout()
+        for widget in (set_in, set_out):
+            marcatura.addWidget(widget)
+        marcatura.addStretch(1)
+        marcatura.addWidget(grab)
+        layout.addLayout(marcatura)
 
         self.media_info_label = QLabel("Nessun file caricato.")
-        g.addWidget(self.media_info_label, 4, 0, 1, 4)
-
-        cutbox = QGroupBox("Taglio")
-        cg = QGridLayout(cutbox)
-        self.in_time = QLineEdit("00:00:00")
-        self.out_time = QLineEdit("00:00:10")
-        self.precise = QCheckBox("Taglio preciso (ricodifica)")
-        self.precise.setChecked(True)
-        cut = QPushButton("✂ Tieni solo la selezione")
-        cut.clicked.connect(self.cut)
-        remove = QPushButton("✀ Rimuovi la selezione")
-        remove.setToolTip("Elimina l'intervallo IN–OUT e ricuce le parti rimanenti.")
-        remove.clicked.connect(self.remove_section)
-        cg.addWidget(QLabel("IN"), 0, 0)
-        cg.addWidget(self.in_time, 0, 1)
-        cg.addWidget(QLabel("OUT"), 1, 0)
-        cg.addWidget(self.out_time, 1, 1)
-        cg.addWidget(self.precise, 2, 0, 1, 2)
-        cg.addWidget(cut, 3, 0, 1, 2)
-        cg.addWidget(remove, 4, 0, 1, 2)
-        g.addWidget(cutbox, 5, 0, 1, 2)
-
-        trans = QGroupBox("Video / Audio")
-        tg = QGridLayout(trans)
-        self.width = QLineEdit()
-        self.width.setPlaceholderText("es. 1280 o -1")
-        self.height = QLineEdit()
-        self.height.setPlaceholderText("es. 720 o -1")
-        self.rotate = QComboBox()
-        self.rotate.addItems(["none", "90", "180", "270"])
-        self.volume = QDoubleSpinBox()
-        self.volume.setRange(0, 5)
-        self.volume.setValue(1.0)
-        self.volume.setSingleStep(.1)
-        self.fadein = QLineEdit()
-        self.fadeout = QLineEdit()
-        for r, (name, widget) in enumerate([
-                ("Larghezza", self.width), ("Altezza", self.height),
-                ("Rotazione", self.rotate), ("Volume", self.volume),
-                ("Fade in (s)", self.fadein), ("Fade out (s)", self.fadeout)]):
-            tg.addWidget(QLabel(name), r, 0)
-            tg.addWidget(widget, r, 1)
-        transform = QPushButton("Applica trasformazioni")
-        transform.clicked.connect(self.transform)
-        tg.addWidget(transform, 6, 0, 1, 2)
-        g.addWidget(trans, 5, 2, 1, 2)
-
-        audio = QGroupBox("Audio")
-        ag = QGridLayout(audio)
-        extract = QPushButton("Estrai audio")
-        extract.clicked.connect(self.extract_audio)
-        replace = QPushButton("Sostituisci traccia audio")
-        replace.clicked.connect(self.replace_audio)
-        ag.addWidget(extract, 0, 0)
-        ag.addWidget(replace, 0, 1)
-        g.addWidget(audio, 6, 0, 1, 4)
-
-        for widget in (self.in_time, self.out_time, self.width, self.height,
-                       self.fadein, self.fadeout):
-            widget.textChanged.connect(self._update_preview)
-        self.in_time.textChanged.connect(self._sync_timeline_selection)
-        self.out_time.textChanged.connect(self._sync_timeline_selection)
-        self.rotate.currentTextChanged.connect(self._update_preview)
-        self.volume.valueChanged.connect(self._update_preview)
-        self.precise.toggled.connect(self._update_preview)
-        return w
+        self.media_info_label.setObjectName("sectionLabel")
+        layout.addWidget(self.media_info_label)
+        return pannello
 
     def _tools_tab(self):
         w = QWidget()
@@ -411,16 +483,30 @@ class MainWindow(QMainWindow):
         w = QWidget()
         g = QVBoxLayout(w)
         self.extra = QTextEdit()
+        self.extra.setFont(theme.mono_font(9))
         self.extra.setPlaceholderText("Argomenti extra yt-dlp, uno per riga (es. --cookies-from-browser firefox)")
         self.extra.setMaximumHeight(120)
         self.extra.textChanged.connect(self._update_preview)
-        g.addWidget(QLabel("Argomenti yt-dlp"))
+        aspetto = QHBoxLayout()
+        aspetto.addWidget(self._section_label("Aspetto"))
+        self.theme_box = QComboBox()
+        self.theme_box.addItems(theme.available_themes())
+        if "pywal" not in theme.available_themes():
+            self.theme_box.setToolTip(
+                "Il tema pywal compare quando esiste ~/.cache/wal/colors.json")
+        self.theme_box.currentTextChanged.connect(self.change_theme)
+        aspetto.addWidget(self.theme_box)
+        aspetto.addStretch(1)
+        g.addLayout(aspetto)
+
+        g.addWidget(self._section_label("Argomenti yt-dlp"))
         g.addWidget(self.extra)
 
         self.cmd_preview = QTextEdit()
         self.cmd_preview.setReadOnly(True)
         self.cmd_preview.setLineWrapMode(QTextEdit.NoWrap)
-        g.addWidget(QLabel("Anteprima comandi (aggiornata in tempo reale)"))
+        self.cmd_preview.setFont(theme.mono_font(9))
+        g.addWidget(self._section_label("Anteprima comandi (aggiornata in tempo reale)"))
         g.addWidget(self.cmd_preview, 1)
 
         row = QHBoxLayout()
@@ -441,13 +527,19 @@ class MainWindow(QMainWindow):
         self.outdir.setText(s.value("download/outdir", str(Path.home() / "Downloads")))
         self.quality.setCurrentText(s.value("download/quality", QUALITIES[0]))
         self.container.setCurrentText(s.value("download/container", CONTAINERS[0]))
-        self.audio_format.setCurrentText(s.value("download/audio_format", AUDIO_FORMATS[0]))
+        self.audio_format.setCurrentText(s.value("download/audio_format", KEEP_ORIGINAL))
         self.sub_langs.setText(s.value("download/sub_langs", "all"))
         self.audio_only.setChecked(s.value("download/audio_only", False, type=bool))
         self.subs.setChecked(s.value("download/subs", False, type=bool))
         self.playlist.setChecked(s.value("download/playlist", False, type=bool))
         self.precise.setChecked(s.value("edit/precise", True, type=bool))
         self.extra.setPlainText(s.value("advanced/extra", ""))
+        stato = s.value("edit/splitter")
+        if stato:
+            self.editor_splitter.restoreState(stato)
+        salvato = s.value("ui/theme", "scuro")
+        if salvato in theme.available_themes():
+            self.theme_box.setCurrentText(salvato)
         self._sync_download_controls()
 
     def _save_settings(self):
@@ -463,6 +555,7 @@ class MainWindow(QMainWindow):
         s.setValue("download/playlist", self.playlist.isChecked())
         s.setValue("edit/precise", self.precise.isChecked())
         s.setValue("advanced/extra", self.extra.toPlainText())
+        s.setValue("edit/splitter", self.editor_splitter.saveState())
         s.sync()
 
     def _sync_download_controls(self):
@@ -471,6 +564,23 @@ class MainWindow(QMainWindow):
         self.container.setEnabled(not audio)
         self.quality.setEnabled(not audio)
         self.sub_langs.setEnabled(self.subs.isChecked())
+
+    @safe_slot
+    def _save_splitter(self, *_):
+        self.settings.setValue("edit/splitter", self.editor_splitter.saveState())
+
+    @safe_slot
+    def change_theme(self, nome):
+        """Applica il tema subito: nessun riavvio, nessuna finestra da riaprire."""
+        app = QApplication.instance()
+        if app is None:
+            return
+        tavolozza = theme.apply(app, nome)
+        self.settings.setValue("ui/theme", nome)
+        self.timeline.update()
+        if self.video is not None:
+            self.video.update()
+        self.statusBar().showMessage(f"Tema: {tavolozza.name}")
 
     # ------------------------------------------------------------- utilità
 
@@ -496,7 +606,7 @@ class MainWindow(QMainWindow):
             "subtitles": self.subs.isChecked(),
             "container": self.container.currentText(),
             "sub_langs": self.sub_langs.text(),
-            "audio_format": self.audio_format.currentText(),
+            "audio_format": audio_format_value(self.audio_format.currentText()),
             "extra_args": self.extra_args(),
             "playlist": self.playlist.isChecked(),
             "section": self.selected_section(),
@@ -556,6 +666,7 @@ class MainWindow(QMainWindow):
             details.append("video" if info.has_video else "nessun video")
             details.append("audio" if info.has_audio else "nessun audio")
             self.media_info_label.setText(" · ".join(details))
+            self.viewer_box.set_ratio(info.width, info.height)
             if info.duration:
                 self.timeline.set_duration(info.duration)
                 self.out_time.setText(format_timestamp(info.duration))
@@ -748,10 +859,12 @@ class MainWindow(QMainWindow):
         self._remote_duration = float(data.get("duration") or 0.0)
         self._analyzed_url = self.analyze_worker.url if self.analyze_worker else ""
         self.edit_file.setText(self._analyzed_url)
+        self.viewer_box.set_ratio(data.get("width"), data.get("height"))
         self.tabs.setCurrentIndex(1)
-        if self.player.available():
-            self.play_file()
-        else:
+        # Nessuna riproduzione automatica: partire da soli a volume pieno è un
+        # modo sicuro per far saltare sulla sedia chi ha le cuffie.
+        self.statusBar().showMessage("Pronto: premi ▶ Riproduci per l'anteprima")
+        if not self.player.available():
             self.log_line("mpv non disponibile: anteprima in streaming non possibile.")
 
     @safe_slot
@@ -963,7 +1076,7 @@ class MainWindow(QMainWindow):
             return
         dst = self.output_path("_edited")
         args = self._guard(lambda: transform_cmd(
-            src, dst, self.width.text(), self.height.text(), self.rotate.currentText(),
+            src, dst, self.scale_width.text(), self.scale_height.text(), self.rotate.currentText(),
             str(self.volume.value()), self.fadein.text(), self.fadeout.text()))
         if not args:
             return
@@ -1110,7 +1223,7 @@ class MainWindow(QMainWindow):
                 ("taglio", lambda: cut_cmd(src, self.output_path("_cut"), self.in_time.text(),
                                            self.out_time.text(), self.precise.isChecked())),
                 ("trasformazione", lambda: transform_cmd(
-                    src, self.output_path("_edited"), self.width.text(), self.height.text(),
+                    src, self.output_path("_edited"), self.scale_width.text(), self.scale_height.text(),
                     self.rotate.currentText(), str(self.volume.value()),
                     self.fadein.text(), self.fadeout.text())),
             ):

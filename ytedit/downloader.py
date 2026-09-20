@@ -9,6 +9,14 @@ from PySide6.QtCore import QThread, Signal
 
 # Marcatore per riconoscere senza ambiguità il path finale stampato da yt-dlp.
 FILE_SENTINEL = "@@YTEDIT_FILE@@"
+# Voce dell'interfaccia che significa "non ricodificare": da YouTube la sorgente
+# è già lossy, riconvertirla può solo peggiorarla.
+KEEP_ORIGINAL = "originale"
+
+
+def audio_format_value(label: str) -> str:
+    """Dall'etichetta mostrata al valore che vuole yt-dlp."""
+    return "best" if label == KEEP_ORIGINAL else label
 _PERCENT_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 
 

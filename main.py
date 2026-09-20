@@ -9,13 +9,16 @@ from ytedit.qtplatform import prefer_x11_for_embedding
 if not video_widget.is_available():
     prefer_x11_for_embedding()
 
+from PySide6.QtCore import QSettings  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+from ytedit import theme  # noqa: E402
 from ytedit.main_window import MainWindow  # noqa: E402
 
 app = QApplication(sys.argv)
 app.setApplicationName("ytEdit")
 app.setOrganizationName("ytEdit")
+theme.apply(app, QSettings("ytEdit", "ytEdit").value("ui/theme", "scuro"))
 window = MainWindow()
 window.show()
 sys.exit(app.exec())

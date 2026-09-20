@@ -49,7 +49,9 @@ Per una diagnosi dell'ambiente: `python -m ytedit.doctor`.
 **Download**
 - analisi dell'URL con yt-dlp (asincrona, l'interfaccia non si blocca)
 - selezione qualità (fino a 1080p/720p/480p/360p) e contenitore (MP4/MKV/WEBM)
-- solo audio in mp3, m4a, opus, flac o wav
+- solo audio: **originale** (nessuna ricodifica, predefinito) oppure opus, m4a,
+  mp3, flac, wav — da YouTube la sorgente è già lossy, quindi convertirla in flac
+  non aggiunge nulla e ricomprimerla in mp3 toglie
 - sottotitoli con scelta delle lingue (`it,en` oppure `all`)
 - opzione **Intera playlist**: spenta (predefinita) un URL con `&list=` scarica
   solo il video indicato; accesa scarica tutta la playlist in una sottocartella
@@ -97,6 +99,27 @@ pulsante Scarica.
 - anteprima in tempo reale dei comandi yt-dlp e FFmpeg che verranno eseguiti
 - interruzione dell'operazione FFmpeg in corso
 - impostazioni persistenti (destinazione, qualità, formato, lingue, geometria finestra)
+
+## Aspetto
+
+Tre temi, selezionabili nel tab **Avanzato** e applicati a caldo, senza riavviare:
+
+| Tema | Da dove viene |
+|---|---|
+| `scuro` | predefinito |
+| `chiaro` | per chi lavora con luce in faccia |
+| `pywal` | letto da `~/.cache/wal/colors.json`, compare solo se il file esiste |
+
+Cambia la palette, non il significato dei colori: l'accento marca ciò che è
+selezionato o attivo, un secondo colore compare solo sull'azione che distrugge, e
+il riquadro del video resta scuro in ogni tema perché un'immagine si giudica su un
+contorno neutro.
+
+Per pywal accento e colore di pericolo si scelgono per saturazione e tinta, non
+per indice: `color1` non è affidabilmente "il rosso", dipende dall'immagine.
+
+Interfaccia in Adwaita Sans, timecode e comandi in JetBrains Mono (cifre
+incolonnate). Tutto in `ytedit/theme.py`.
 
 ## Note
 

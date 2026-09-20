@@ -7,8 +7,11 @@ su Wayland nativo e il video non può finire in una finestra separata.
 import os
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QOpenGLContext
+from PySide6.QtGui import QColor, QOpenGLContext, QPainter, QPen
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
+from PySide6.QtWidgets import QHBoxLayout, QSizePolicy, QWidget
+
+from . import theme
 
 os.environ.setdefault("LC_NUMERIC", "C")  # libmpv pretende la locale C
 
@@ -48,7 +51,6 @@ class VideoWidget(QOpenGLWidget):
 
     def __init__(self, parent=None, ytdl_path=None):
         super().__init__(parent)
-        self.setMinimumHeight(260)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
 
         self.path = None
@@ -91,7 +93,8 @@ class VideoWidget(QOpenGLWidget):
             self._start(*pending)
 
     def paintGL(self):
-        if self._render_context is None or self._destroyed:
+        if self.path is None or self._render_context is None or self._destroyed:
+            self._paint_placeholder()
             return
         ratio = self.devicePixelRatioF()
         self._render_context.render(flip_y=True, opengl_fbo={
@@ -100,6 +103,28 @@ class VideoWidget(QOpenGLWidget):
             "fbo": self.defaultFramebufferObject(),
         })
         self.frames_rendered += 1
+        self._paint_frame()
+
+    def _paint_frame(self):
+        """Filetto attorno all'immagine: separa il visore dal pannello."""
+        painter = QPainter(self)
+        painter.setPen(QPen(QColor(theme.current().edge), 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        painter.end()
+
+    def _paint_placeholder(self):
+        """Schermo vuoto: dice cosa fare, invece di restare nero e muto."""
+        painter = QPainter(self)
+        tavolozza = theme.current()
+        painter.fillRect(self.rect(), QColor(tavolozza.viewer))
+        painter.setPen(QColor(tavolozza.mute))
+        painter.setFont(theme.ui_font(11))
+        painter.drawText(self.rect(), Qt.AlignCenter,
+                         "Incolla un URL e premi Analizza,\noppure apri un file.")
+        painter.setPen(QPen(QColor(tavolozza.edge), 1))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        painter.end()
 
     # ------------------------------------------------------- riproduzione
 
@@ -207,3 +232,56 @@ class VideoWidget(QOpenGLWidget):
         text = text.strip()
         if level in ("error", "fatal") and not any(b in text for b in self._BENIGN):
             self.message.emit(f"mpv: {text}")
+
+
+class AspectBox(QWidget):
+    """Contiene il visore mantenendone le proporzioni, centrato.
+
+    Niente layout interno di proposito: un figlio a dimensione fissa alzerebbe
+    il minimo del contenitore, che quindi non potrebbe più rimpicciolirsi —
+    con lo splitter si otterrebbe un visore che cresce e non torna indietro.
+    Qui la geometria del figlio è calcolata a mano e non influenza il genitore.
+    """
+
+    MIN_SIDE = 160
+
+    def __init__(self, child, parent=None):
+        super().__init__(parent)
+        self._child = child
+        self._ratio = 16 / 9
+        child.setParent(self)
+        child.setMinimumSize(1, 1)
+        self.setMinimumSize(self.MIN_SIDE, int(self.MIN_SIDE / self._ratio))
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._fit()
+
+    def child(self):
+        return self._child
+
+    def ratio(self):
+        return self._ratio
+
+    def set_ratio(self, width, height):
+        """Adatta la proporzione alla sorgente: niente bande nere aggiunte."""
+        if not width or not height:
+            return
+        nuovo = float(width) / float(height)
+        if abs(nuovo - self._ratio) > 0.001:
+            self._ratio = nuovo
+            self._fit()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._fit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit()
+
+    def _fit(self):
+        """Il rettangolo più grande con le proporzioni giuste che ci sta dentro."""
+        larghezza = min(self.width(), self.height() * self._ratio)
+        altezza = larghezza / self._ratio
+        x = (self.width() - larghezza) / 2
+        y = (self.height() - altezza) / 2
+        self._child.setGeometry(int(x), int(y), int(max(1, larghezza)), int(max(1, altezza)))
