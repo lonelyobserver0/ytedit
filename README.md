@@ -142,3 +142,9 @@ figures). It all lives in `ytedit/theme.py`.
   VP9/Opus for WebM, the native codec for audio-only containers).
 - Fast cutting without re-encoding cuts at the nearest keyframe: an exact start
   point needs precise cutting.
+
+## Support
+
+If ytEdit saves you some time:
+
+<a href="https://ko-fi.com/lonelyobserver0"><img src="https://storage.ko-fi.com/cdn/kofi2.png?v=3" alt="Buy me a coffee at ko-fi.com" height="36"></a>
