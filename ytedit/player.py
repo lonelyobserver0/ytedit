@@ -56,7 +56,7 @@ class MPVPlayer(QObject):
         """`path` può essere un file locale o un URL: mpv lo apre in streaming
         passando da yt-dlp, senza scaricare nulla su disco."""
         if not self.available():
-            self.message.emit("mpv non trovato nel PATH.")
+            self.message.emit("mpv not found in the PATH.")
             return False
         self.stop()
 
@@ -77,8 +77,8 @@ class MPVPlayer(QObject):
             args.append("--force-window=yes")
             if wid is not None:
                 self.message.emit(
-                    "Anteprima integrata non disponibile su questa piattaforma "
-                    "(serve X11): mpv si apre in una finestra separata."
+                    "The embedded preview is not available on this platform "
+                    "(X11 is needed): mpv opens in a separate window."
                 )
         if start:
             args.append(f"--start={start}")
@@ -88,11 +88,11 @@ class MPVPlayer(QObject):
             self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
                                          stderr=subprocess.DEVNULL)
         except OSError as exc:
-            self.message.emit(f"Avvio mpv fallito: {exc}")
+            self.message.emit(f"Could not start mpv: {exc}")
             return False
 
         self.path = str(path)
-        self.message.emit(f"Riproduzione: {path}")
+        self.message.emit(f"Playing: {path}")
         return True
 
     def _command(self, *cmd):

@@ -26,7 +26,7 @@ def package_version(name: str) -> str:
         from importlib.metadata import version as metadata_version
         return metadata_version(name.replace("_", "-"))
     except Exception:
-        return "versione sconosciuta"
+        return "unknown version"
 
 
 def main() -> int:
@@ -37,18 +37,18 @@ def main() -> int:
         try:
             print(f"→ {name:<12} {package_version(name)}")
         except ImportError as exc:
-            print(f"✖ {name:<12} non importabile: {exc}")
+            print(f"✖ {name:<12} cannot be imported: {exc}")
             ok = False
 
     for tool in REQUIRED_TOOLS:
         path = shutil.which(tool)
-        print(f"{'→' if path else '✖'} {tool:<12} {path or 'non trovato nel PATH'}")
+        print(f"{'→' if path else '✖'} {tool:<12} {path or 'not found in the PATH'}")
         ok = ok and bool(path)
 
     for tool in OPTIONAL_TOOLS:
         path = shutil.which(tool)
         print(f"{'→' if path else '!'} {tool:<12} "
-              f"{path or 'non trovato (anteprima video disattivata)'}")
+              f"{path or 'not found (video preview disabled)'}")
 
     return 0 if ok else 1
 

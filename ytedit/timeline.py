@@ -202,7 +202,7 @@ class Timeline(QWidget):
         else:
             painter.setPen(QPen(spento))
             painter.setFont(theme.ui_font(9))
-            painter.drawText(track, Qt.AlignCenter, "Nessuna sorgente caricata")
+            painter.drawText(track, Qt.AlignCenter, "No source loaded")
 
         # Timecode in monospaziato: cifre incolonnate, si confrontano a colpo d'occhio.
         painter.setFont(theme.mono_font(9))

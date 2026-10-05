@@ -29,7 +29,7 @@ def is_available() -> bool:
 
 
 def unavailable_reason() -> str:
-    return _IMPORT_ERROR or "python-mpv non installato"
+    return _IMPORT_ERROR or "python-mpv is not installed"
 
 
 def _get_proc_address(_ctx, name):
@@ -84,7 +84,7 @@ class VideoWidget(QOpenGLWidget):
                 opengl_init_params={"get_proc_address": self._proc_address_cb},
             )
         except Exception as exc:  # contesto GL inadatto: meglio dirlo
-            self.message.emit(f"Impossibile inizializzare il rendering video: {exc}")
+            self.message.emit(f"Could not initialise video rendering: {exc}")
             return
         # Arriva dal thread di rendering di mpv: rimbalza sul thread GUI.
         self._render_context.update_cb = self._frame_ready.emit
@@ -121,7 +121,7 @@ class VideoWidget(QOpenGLWidget):
         painter.setPen(QColor(tavolozza.mute))
         painter.setFont(theme.ui_font(11))
         painter.drawText(self.rect(), Qt.AlignCenter,
-                         "Incolla un URL e premi Analizza,\noppure apri un file.")
+                         "Paste a URL and press Analyze,\nor open a file.")
         painter.setPen(QPen(QColor(tavolozza.edge), 1))
         painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
         painter.end()
@@ -157,10 +157,10 @@ class VideoWidget(QOpenGLWidget):
             self.mpv.play(str(path))
             self.mpv.pause = False
         except Exception as exc:
-            self.message.emit(f"Riproduzione fallita: {exc}")
+            self.message.emit(f"Playback failed: {exc}")
             return False
         self.path = str(path)
-        self.message.emit(f"Riproduzione: {path}")
+        self.message.emit(f"Playing: {path}")
         return True
 
     def toggle_pause(self):
@@ -174,7 +174,7 @@ class VideoWidget(QOpenGLWidget):
                 # i punti IN/OUT non corrisponderebbero a quanto si vede.
                 self.mpv.seek(float(seconds), reference=mode, precision="exact")
             except Exception as exc:
-                self.message.emit(f"Seek fallito: {exc}")
+                self.message.emit(f"Seek failed: {exc}")
 
     def _property(self, name):
         """Le proprietà runtime si leggono come attributi: `mpv["x"]` accede

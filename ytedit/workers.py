@@ -46,7 +46,7 @@ class ProcessWorker(QThread):
                 stderr=subprocess.STDOUT, text=True, bufsize=1,
             )
         except OSError as exc:
-            self.output.emit(f"ERRORE: {exc}")
+            self.output.emit(f"ERROR: {exc}")
             self.finished_ok.emit(-1, str(exc))
             return
 
@@ -65,14 +65,14 @@ class ProcessWorker(QThread):
         except (OSError, ValueError):
             pass
         except Exception:
-            self.output.emit("ERRORE imprevisto:\n" + traceback.format_exc())
+            self.output.emit("Unexpected ERROR:\n" + traceback.format_exc())
         finally:
             if self.proc.stdout:
                 self.proc.stdout.close()
 
         code = self.proc.wait()
         if self._stop:
-            self.finished_ok.emit(-2, "Operazione interrotta.")
+            self.finished_ok.emit(-2, "Operation stopped.")
         else:
             if code == 0:
                 self._emit_progress(100)

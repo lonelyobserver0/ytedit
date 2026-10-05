@@ -18,7 +18,7 @@ from ytedit.main_window import MainWindow  # noqa: E402
 app = QApplication(sys.argv)
 app.setApplicationName("ytEdit")
 app.setOrganizationName("ytEdit")
-theme.apply(app, QSettings("ytEdit", "ytEdit").value("ui/theme", "scuro"))
+theme.apply(app, QSettings("ytEdit", "ytEdit").value("ui/theme", "dark"))
 window = MainWindow()
 window.show()
 sys.exit(app.exec())

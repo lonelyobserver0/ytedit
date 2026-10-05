@@ -11,7 +11,7 @@ from PySide6.QtCore import QThread, Signal
 FILE_SENTINEL = "@@YTEDIT_FILE@@"
 # Voce dell'interfaccia che significa "non ricodificare": da YouTube la sorgente
 # è già lossy, riconvertirla può solo peggiorarla.
-KEEP_ORIGINAL = "originale"
+KEEP_ORIGINAL = "original"
 
 
 def audio_format_value(label: str) -> str:
@@ -133,18 +133,18 @@ class YTDLPWorker(QThread):
         except (OSError, ValueError):
             pass
         except Exception:
-            self.error.emit("Errore imprevisto nel download:\n" + traceback.format_exc())
+            self.error.emit("Unexpected error during the download:\n" + traceback.format_exc())
         finally:
             if self.proc.stdout:
                 self.proc.stdout.close()
 
         code = self.proc.wait()
         if self._stop:
-            self.error.emit("Download interrotto.")
+            self.error.emit("Download stopped.")
         elif code == 0:
             self.result.emit(final_path)
         else:
-            self.error.emit("\n".join(out[-30:]) or f"yt-dlp uscito con codice {code}")
+            self.error.emit("\n".join(out[-30:]) or f"yt-dlp exited with code {code}")
 
     def stop(self):
         self._stop = True
@@ -186,7 +186,7 @@ class AnalyzeWorker(QThread):
         try:
             self._analyze()
         except Exception:
-            self.error.emit("Errore imprevisto durante l'analisi:\n" + traceback.format_exc())
+            self.error.emit("Unexpected error during the analysis:\n" + traceback.format_exc())
 
     def _analyze(self):
         import json
@@ -199,8 +199,8 @@ class AnalyzeWorker(QThread):
         except subprocess.TimeoutExpired:
             self.stop()
             self.error.emit(
-                "Analisi scaduta dopo 120 s. Se l'URL contiene '&list=' prova a "
-                "rimuovere la parte della playlist, oppure attiva 'Intera playlist'."
+                "Analysis timed out after 120 s. If the URL contains '&list=' try "
+                "removing the playlist part, or turn on 'Whole playlist'."
             )
             return
         except OSError as exc:
@@ -214,19 +214,19 @@ class AnalyzeWorker(QThread):
                 self.line.emit(warning.strip())
         if self.proc.returncode:
             self.error.emit((err or "").strip()
-                            or f"yt-dlp uscito con codice {self.proc.returncode}")
+                            or f"yt-dlp exited with code {self.proc.returncode}")
             return
         if not (out or "").strip():
-            self.error.emit("yt-dlp non ha restituito alcun dato (uscita vuota).")
+            self.error.emit("yt-dlp returned no data at all (empty output).")
             return
         try:
             data = json.loads(out)
         except ValueError as exc:
-            self.error.emit(f"Risposta yt-dlp non leggibile ({exc}). "
-                            f"Inizio della risposta: {out[:200]!r}")
+            self.error.emit(f"Unreadable yt-dlp response ({exc}). "
+                            f"Start of the response: {out[:200]!r}")
             return
         if not isinstance(data, dict):
-            self.error.emit(f"yt-dlp ha restituito {type(data).__name__} invece di un oggetto JSON.")
+            self.error.emit(f"yt-dlp returned {type(data).__name__} instead of a JSON object.")
             return
         self.result.emit(data)
 

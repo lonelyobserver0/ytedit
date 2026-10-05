@@ -19,6 +19,6 @@ def prefer_x11_for_embedding(environ=None, announce=True):
         return None
     env["QT_QPA_PLATFORM"] = "xcb"
     if announce:
-        print("ytEdit: piattaforma Qt 'xcb' per l'anteprima video integrata "
-              "(QT_QPA_PLATFORM=wayland per disattivarla).", flush=True)
+        print("ytEdit: Qt platform 'xcb' for the embedded video preview "
+              "(QT_QPA_PLATFORM=wayland to turn it off).", flush=True)
     return "xcb"

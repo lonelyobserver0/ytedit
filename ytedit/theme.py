@@ -39,7 +39,7 @@ class Palette:
 
 
 DARK = Palette(
-    name="scuro",
+    name="dark",
     bench="#1B2124", well="#141A1C", raised="#232B2F", edge="#2E3A3F",
     mark="#D7DEDB", mute="#8A9AA0",
     accent="#E8A33D", accent_dim="#8A6426", on_accent="#141A1C",
@@ -47,7 +47,7 @@ DARK = Palette(
 )
 
 LIGHT = Palette(
-    name="chiaro",
+    name="light",
     bench="#E8ECEB", well="#F7F9F8", raised="#FFFFFF", edge="#C2CBC9",
     mark="#1B2124", mute="#5E6C69",
     accent="#B4711A", accent_dim="#8A5713", on_accent="#FFFFFF",
@@ -161,14 +161,14 @@ def pywal_palette(path=None):
 
 def available_themes():
     """Nomi dei temi utilizzabili adesso, in ordine di presentazione."""
-    nomi = ["scuro", "chiaro"]
+    nomi = ["dark", "light"]
     if pywal_available():
         nomi.append("pywal")
     return nomi
 
 
 def palette_named(name):
-    if name == "chiaro":
+    if name == "light":
         return LIGHT
     if name == "pywal":
         return pywal_palette() or DARK
@@ -342,7 +342,7 @@ QFrame#viewer {{ background: {p.viewer}; border: 1px solid {p.edge}; }}
 """
 
 
-def apply(app, name="scuro"):
+def apply(app, name="dark"):
     """Applica un tema all'applicazione. Si può chiamare a caldo."""
     global _current
     _current = palette_named(name)

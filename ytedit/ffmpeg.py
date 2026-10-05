@@ -168,19 +168,19 @@ def parse_timestamp(value) -> float:
     """Accetta `SS`, `MM:SS`, `HH:MM:SS` con decimali; restituisce secondi."""
     text = str(value).strip().replace(",", ".")
     if not text:
-        raise FFmpegError("Timestamp vuoto.")
+        raise FFmpegError("Empty timestamp.")
     parts = text.split(":")
     if len(parts) > 3:
-        raise FFmpegError(f"Timestamp non valido: {value}")
+        raise FFmpegError(f"Invalid timestamp: {value}")
     total = 0.0
     for part in parts:
         part = part.strip() or "0"
         try:
             total = total * 60 + float(part)
         except ValueError:
-            raise FFmpegError(f"Timestamp non valido: {value}") from None
+            raise FFmpegError(f"Invalid timestamp: {value}") from None
     if total < 0:
-        raise FFmpegError(f"Timestamp negativo: {value}")
+        raise FFmpegError(f"Negative timestamp: {value}")
     return total
 
 
@@ -206,13 +206,13 @@ def cut_cmd(src, dst, start, end, precise: bool = False) -> list[str]:
     start_s = parse_timestamp(start)
     end_s = parse_timestamp(end)
     if end_s <= start_s:
-        raise FFmpegError("OUT deve essere maggiore di IN.")
+        raise FFmpegError("OUT must be greater than IN.")
     duration = end_s - start_s
 
     info = media_info(src)
     if info.probed and info.duration and start_s >= info.duration:
         raise FFmpegError(
-            f"IN ({format_timestamp(start_s)}) oltre la durata del file "
+            f"IN ({format_timestamp(start_s)}) is past the end of the file "
             f"({format_timestamp(info.duration)})."
         )
 
@@ -223,13 +223,13 @@ def cut_cmd(src, dst, start, end, precise: bool = False) -> list[str]:
     if info.probed:
         if info.has_video and not can_copy_video(info, dst):
             raise FFmpegError(
-                f"Il codec video {info.video_codec or '?'} non è compatibile con "
-                f"{Path(dst).suffix or 'questo contenitore'}: usa il taglio preciso."
+                f"The video codec {info.video_codec or '?'} is not compatible with "
+                f"{Path(dst).suffix or 'this container'}: use the precise cut."
             )
         if info.has_audio and not can_copy_audio(info, dst):
             raise FFmpegError(
-                f"Il codec audio {info.audio_codec or '?'} non è compatibile con "
-                f"{Path(dst).suffix or 'questo contenitore'}: usa il taglio preciso."
+                f"The audio codec {info.audio_codec or '?'} is not compatible with "
+                f"{Path(dst).suffix or 'this container'}: use the precise cut."
             )
     return args + ["-c", "copy", str(dst)]
 
@@ -249,7 +249,7 @@ def transform_cmd(src, dst, width="", height="", rotate="none", volume="1.0",
     width, height = str(width).strip(), str(height).strip()
     if width or height:
         if not (width and height):
-            raise FFmpegError("Specifica sia larghezza sia altezza (usa -1 per il lato automatico).")
+            raise FFmpegError("Give both width and height (use -1 for the automatic side).")
         vf.append(f"scale={width}:{height}")
 
     if rotate == "90":
@@ -261,7 +261,7 @@ def transform_cmd(src, dst, width="", height="", rotate="none", volume="1.0",
 
     if subtitles:
         if not Path(subtitles).exists():
-            raise FFmpegError(f"File sottotitoli non trovato: {subtitles}")
+            raise FFmpegError(f"Subtitle file not found: {subtitles}")
         vf.append(f"subtitles=filename={_escape_filter_path(Path(subtitles).resolve())}")
 
     volume = str(volume).strip()
@@ -274,7 +274,7 @@ def transform_cmd(src, dst, width="", height="", rotate="none", volume="1.0",
     if fade_out:
         seconds = parse_timestamp(fade_out)
         if not info.duration:
-            raise FFmpegError("Durata del file sconosciuta: impossibile calcolare il fade out.")
+            raise FFmpegError("File duration unknown: cannot work out the fade out.")
         af.append(f"afade=t=out:st={max(0.0, info.duration - seconds):.3f}:d={seconds}")
 
     args = [FFMPEG, "-y", "-i", str(src)]
@@ -288,11 +288,11 @@ def transform_cmd(src, dst, width="", height="", rotate="none", volume="1.0",
         return args + info.encode_args(dst) + [str(dst)]
     if vf:
         if info.probed and not info.has_video:
-            raise FFmpegError("Il file non contiene video: filtri video non applicabili.")
+            raise FFmpegError("The file holds no video: video filters do not apply.")
         args += ["-vf", ",".join(vf)]
     if af:
         if info.probed and not info.has_audio:
-            raise FFmpegError("Il file non contiene audio: filtri audio non applicabili.")
+            raise FFmpegError("The file holds no audio: audio filters do not apply.")
         args += ["-af", ",".join(af)]
 
     encode = []
@@ -316,19 +316,19 @@ def remove_section_cmd(src, dst, start, end) -> list[str]:
     start_s = parse_timestamp(start)
     end_s = parse_timestamp(end)
     if end_s <= start_s:
-        raise FFmpegError("La fine della selezione deve superare l'inizio.")
+        raise FFmpegError("The end of the selection must come after its start.")
 
     info = media_info(src)
     duration = info.duration
     if info.probed and duration:
         if start_s >= duration:
             raise FFmpegError(
-                f"La selezione inizia oltre la fine del file "
+                f"The selection starts past the end of the file "
                 f"({format_timestamp(duration)})."
             )
         end_s = min(end_s, duration)
         if start_s <= 0 and end_s >= duration - 0.05:
-            raise FFmpegError("La selezione copre tutto il file: non resterebbe nulla.")
+            raise FFmpegError("The selection covers the whole file: nothing would be left.")
 
     # Se la selezione tocca un estremo resta un solo spezzone: basta un taglio.
     if start_s <= 0:
@@ -372,9 +372,9 @@ def burn_subtitles_cmd(src, subtitles, dst) -> list[str]:
     """Masterizza i sottotitoli nel video (irreversibile, richiede ricodifica)."""
     info = media_info(src)
     if info.probed and not info.has_video:
-        raise FFmpegError("Il file non contiene video.")
+        raise FFmpegError("The file holds no video.")
     if not Path(subtitles).exists():
-        raise FFmpegError(f"File sottotitoli non trovato: {subtitles}")
+        raise FFmpegError(f"Subtitle file not found: {subtitles}")
     args = [FFMPEG, "-y", "-i", str(src),
             "-vf", f"subtitles=filename={_escape_filter_path(Path(subtitles).resolve())}",
             *video_encode_for(dst)]
@@ -385,7 +385,7 @@ def burn_subtitles_cmd(src, subtitles, dst) -> list[str]:
 def mux_subtitles_cmd(src, subtitles, dst) -> list[str]:
     """Aggiunge i sottotitoli come traccia separata (attivabile nel player)."""
     if not Path(subtitles).exists():
-        raise FFmpegError(f"File sottotitoli non trovato: {subtitles}")
+        raise FFmpegError(f"Subtitle file not found: {subtitles}")
     codec = "mov_text" if Path(dst).suffix.lower() in (".mp4", ".m4v", ".mov") else "srt"
     return [FFMPEG, "-y", "-i", str(src), "-i", str(subtitles),
             "-map", "0", "-map", "1", "-c", "copy", "-c:s", codec,
@@ -413,12 +413,12 @@ def concat_encode_cmd(paths, dst) -> list[str]:
     """Concatenazione con ricodifica: tollera sorgenti eterogenee."""
     paths = list(paths)
     if len(paths) < 2:
-        raise FFmpegError("Servono almeno due file da unire.")
+        raise FFmpegError("At least two files are needed to merge.")
     infos = [media_info(p) for p in paths]
     has_video = all(i.has_video for i in infos)
     has_audio = all(i.has_audio for i in infos)
     if not has_video and not has_audio:
-        raise FFmpegError("I file selezionati non condividono né video né audio.")
+        raise FFmpegError("The selected files share neither video nor audio.")
 
     args = [FFMPEG, "-y"]
     for path in paths:

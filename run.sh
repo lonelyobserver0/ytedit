@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Avvia ytEdit preparando l'ambiente solo quando serve.
-#   ./run.sh              avvia l'applicazione
-#   ./run.sh --xcb        forza X11 (anteprima mpv incorporata su Wayland)
-#   ./run.sh --update     riallinea le dipendenze
-#   ./run.sh --check      verifica l'ambiente senza avviare nulla
+# Starts ytEdit, preparing the environment only when it is needed.
+#   ./run.sh              start the application
+#   ./run.sh --xcb        force X11 (mpv preview embedded on Wayland)
+#   ./run.sh --update     bring the dependencies back in line
+#   ./run.sh --check      check the environment without starting anything
 
 set -euo pipefail
 
@@ -30,15 +30,15 @@ app_args=()
 while (($# > 0)); do
     case "$1" in
         -h | --help)
-            echo "Uso: run.sh [opzioni] [argomenti per main.py]"
+            echo "Usage: run.sh [options] [arguments for main.py]"
             echo
-            echo "  -u, --update   reinstalla/aggiorna le dipendenze Python"
-            echo "  -x, --xcb      forza QT_QPA_PLATFORM=xcb (già predefinito su"
-            echo "                 Wayland quando XWayland è disponibile)"
-            echo "  -w, --wayland  resta su Wayland nativo: l'anteprima mpv si apre"
-            echo "                 in una finestra separata"
-            echo "  -c, --check    verifica ambiente e dipendenze, poi esce"
-            echo "  -h, --help     mostra questo messaggio"
+            echo "  -u, --update   reinstall/upgrade the Python dependencies"
+            echo "  -x, --xcb      force QT_QPA_PLATFORM=xcb (already the default on"
+            echo "                 Wayland when XWayland is available)"
+            echo "  -w, --wayland  stay on native Wayland: the mpv preview opens"
+            echo "                 in a separate window"
+            echo "  -c, --check    check the environment and dependencies, then exit"
+            echo "  -h, --help     show this message"
             exit 0
             ;;
         -u | --update) do_update=1 ;;
@@ -59,27 +59,27 @@ for candidate in python3 python; do
         break
     fi
 done
-[[ -n "$system_python" ]] || _die "Python non trovato nel PATH."
+[[ -n "$system_python" ]] || _die "Python not found in the PATH."
 
 if ! "$system_python" -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)"; then
-    _die "Serve Python 3.9 o superiore."
+    _die "Python 3.9 or newer is required."
 fi
 
 # --- ambiente virtuale -----------------------------------------------------
 
 if [[ ! -x "$python" ]]; then
-    _info "Creazione dell'ambiente virtuale in .venv"
-    "$system_python" -m venv "$venv" || _die "Creazione dell'ambiente virtuale fallita."
+    _info "Creating the virtual environment in .venv"
+    "$system_python" -m venv "$venv" || _die "Could not create the virtual environment."
     rm -f "$stamp"
 fi
 
 # Reinstalla solo se requirements.txt è cambiato dopo l'ultima installazione:
 # l'avvio normale non deve aspettare pip ogni volta.
 if ((do_update)) || [[ ! -f "$stamp" ]] || [[ "$requirements" -nt "$stamp" ]]; then
-    _info "Installazione delle dipendenze Python"
-    "$python" -m pip install --upgrade pip --quiet || _warn "Aggiornamento di pip non riuscito."
+    _info "Installing the Python dependencies"
+    "$python" -m pip install --upgrade pip --quiet || _warn "Could not upgrade pip."
     "$python" -m pip install -r "$requirements" --upgrade --quiet \
-        || _die "Installazione delle dipendenze fallita (riprova con --update)."
+        || _die "Could not install the dependencies (try again with --update)."
     touch "$stamp"
 fi
 
@@ -90,22 +90,24 @@ for tool in ffmpeg ffprobe; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if ((${#missing[@]} > 0)); then
-    _die "Manca $(IFS=', '; echo "${missing[*]}") nel PATH. Su Arch: sudo pacman -S ffmpeg"
+    # ${array[*]} unisce col PRIMO carattere di IFS, uno solo: per ", " serve printf.
+    list="$(printf '%s, ' "${missing[@]}")"
+    _die "${list%, } missing from the PATH. On Arch: sudo pacman -S ffmpeg"
 fi
 command -v mpv >/dev/null 2>&1 \
-    || _warn "mpv non trovato: l'anteprima video sarà disattivata (sudo pacman -S mpv)."
+    || _warn "mpv not found: the video preview will be disabled (sudo pacman -S mpv)."
 
 # --- piattaforma Qt --------------------------------------------------------
 
 if ((force_wayland)); then
     export QT_QPA_PLATFORM=wayland
-    _info "Wayland nativo richiesto: l'anteprima mpv sarà in una finestra separata."
+    _info "Native Wayland requested: the mpv preview will be in a separate window."
 elif ((force_xcb)); then
     if [[ -z "${DISPLAY:-}" ]]; then
-        _warn "Nessun DISPLAY X11 disponibile: ignoro --xcb."
+        _warn "No X11 DISPLAY available: ignoring --xcb."
     else
         export QT_QPA_PLATFORM=xcb
-        _info "Piattaforma Qt forzata a xcb (anteprima mpv incorporata)."
+        _info "Qt platform forced to xcb (mpv preview embedded)."
     fi
 fi
 # Senza flag decide main.py: xcb su Wayland se XWayland c'è, per l'anteprima.
@@ -113,8 +115,8 @@ fi
 # --- avvio -----------------------------------------------------------------
 
 if ((do_check)); then
-    "$python" -m ytedit.doctor || _die "Verifica fallita: risolvi i punti marcati sopra."
-    _info "Ambiente pronto."
+    "$python" -m ytedit.doctor || _die "Check failed: sort out the items marked above."
+    _info "Environment ready."
     exit 0
 fi
 
