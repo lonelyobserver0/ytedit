@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QSplitter, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox, QProgressBar,
     QTextEdit, QFileDialog, QListWidget, QListWidgetItem, QGroupBox,
-    QTabWidget, QDoubleSpinBox, QMessageBox, QSizePolicy, QFrame,
+    QTabWidget, QDoubleSpinBox, QSpinBox, QMessageBox, QSizePolicy, QFrame,
 )
 
 from .downloader import (
@@ -24,13 +24,14 @@ from .downloader import (
     build_command, build_format,
 )
 from .ffmpeg import (
-    FFmpegError, burn_subtitles_cmd, concat_copy_cmd, concat_encode_cmd,
-    cut_cmd, extract_audio_cmd, format_timestamp, media_info, mux_subtitles_cmd,
-    parse_timestamp, remove_section_cmd, replace_audio_cmd, transform_cmd,
+    FFmpegError, animation_cmd, burn_subtitles_cmd, concat_copy_cmd, concat_encode_cmd,
+    cut_cmd, extract_audio_cmd, format_timestamp, frame_cmd, keep_segments_cmd,
+    media_info, mux_subtitles_cmd, parse_timestamp, remove_section_cmd,
+    remove_segments_cmd, replace_audio_cmd, speed_cmd, transform_cmd,
     write_concat_list,
 )
 from .player import MPVPlayer, is_url, ytdl_path
-from .timeline import Timeline
+from .timeline import Timeline, format_time as format_short
 from . import theme
 from . import video_widget
 from .video_widget import AspectBox
@@ -111,6 +112,7 @@ class MainWindow(QMainWindow):
         self._pending_output = None
         self._pending_op = ""
         self._temp_files: list[Path] = []
+        self.segments: list[tuple] = []   # intervalli IN–OUT messi da parte
         self._remote_duration = 0.0
         self._analyzed_url = ""
         self._ipc_failures = 0
@@ -296,80 +298,264 @@ class MainWindow(QMainWindow):
         return w
 
     def _edit_controls(self):
-        """Colonna sinistra: taglio, trasformazioni, audio."""
-        pannello = QWidget()
-        layout = QVBoxLayout(pannello)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        """Colonna sinistra a schede: un gruppo di parametri per volta.
 
-        cutbox = QGroupBox("Cut")
-        cg = QGridLayout(cutbox)
-        self.in_time = QLineEdit("00:00:00")
-        self.out_time = QLineEdit("00:00:10")
-        for campo in (self.in_time, self.out_time):
-            campo.setFont(theme.mono_font(10))
-        self.precise = QCheckBox("Precise cut (re-encode)")
-        self.precise.setChecked(True)
-        cut = QPushButton("✂ Keep selection only")
-        cut.clicked.connect(self.cut)
-        remove = QPushButton("✀ Remove selection")
-        remove.setObjectName("danger")
-        remove.setToolTip("Drops the IN–OUT range and stitches the rest back together.")
-        remove.clicked.connect(self.remove_section)
-        cg.addWidget(QLabel("IN"), 0, 0)
-        cg.addWidget(self.in_time, 0, 1)
-        cg.addWidget(QLabel("OUT"), 1, 0)
-        cg.addWidget(self.out_time, 1, 1)
-        cg.addWidget(self.precise, 2, 0, 1, 2)
-        cg.addWidget(cut, 3, 0, 1, 2)
-        cg.addWidget(remove, 4, 0, 1, 2)
-        layout.addWidget(cutbox)
-
-        trans = QGroupBox("Video / Audio")
-        tg = QGridLayout(trans)
-        self.scale_width = QLineEdit()
-        self.scale_width.setPlaceholderText("e.g. 1280 or -1")
-        self.scale_height = QLineEdit()
-        self.scale_height.setPlaceholderText("e.g. 720 or -1")
-        self.rotate = QComboBox()
-        self.rotate.addItems(["none", "90", "180", "270"])
-        self.volume = QDoubleSpinBox()
-        self.volume.setRange(0, 5)
-        self.volume.setValue(1.0)
-        self.volume.setSingleStep(.1)
-        self.fadein = QLineEdit()
-        self.fadeout = QLineEdit()
-        for r, (name, widget) in enumerate([
-                ("Width", self.scale_width), ("Height", self.scale_height),
-                ("Rotation", self.rotate), ("Volume", self.volume),
-                ("Fade in (s)", self.fadein), ("Fade out (s)", self.fadeout)]):
-            tg.addWidget(QLabel(name), r, 0)
-            tg.addWidget(widget, r, 1)
-        transform = QPushButton("Apply transforms")
-        transform.clicked.connect(self.transform)
-        tg.addWidget(transform, 6, 0, 1, 2)
-        layout.addWidget(trans)
-
-        audio = QGroupBox("Audio")
-        ag = QGridLayout(audio)
-        extract = QPushButton("Extract audio")
-        extract.clicked.connect(self.extract_audio)
-        replace = QPushButton("Replace audio track")
-        replace.clicked.connect(self.replace_audio)
-        ag.addWidget(extract, 0, 0)
-        ag.addWidget(replace, 0, 1)
-        layout.addWidget(audio)
-        layout.addStretch(1)
+        Erano riquadri impilati, e con crop, colore ed export la colonna
+        diventava più alta della finestra. Le schede tengono visibile solo
+        quello su cui si sta lavorando, senza scorrere.
+        """
+        self.tool_tabs = QTabWidget()
+        self.tool_tabs.setObjectName("tools")
+        self.tool_tabs.setMinimumWidth(330)
+        self.tool_tabs.addTab(self._cut_panel(), "Cut")
+        self.tool_tabs.addTab(self._transform_panel(), "Transform")
+        self.tool_tabs.addTab(self._colour_panel(), "Colour")
+        self.tool_tabs.addTab(self._audio_panel(), "Audio")
+        self.tool_tabs.addTab(self._export_panel(), "Export")
+        self.tool_tabs.currentChanged.connect(self._save_tool_tab)
 
         for widget in (self.in_time, self.out_time, self.scale_width, self.scale_height,
-                       self.fadein, self.fadeout):
+                       self.fadein, self.fadeout, self.crop_x, self.crop_y,
+                       self.crop_w, self.crop_h):
             widget.textChanged.connect(self._update_preview)
+        for widget in (self.brightness, self.contrast, self.saturation,
+                       self.gamma, self.volume):
+            widget.valueChanged.connect(self._update_preview)
         self.in_time.textChanged.connect(self._sync_timeline_selection)
         self.out_time.textChanged.connect(self._sync_timeline_selection)
         self.rotate.currentTextChanged.connect(self._update_preview)
-        self.volume.valueChanged.connect(self._update_preview)
         self.precise.toggled.connect(self._update_preview)
-        return pannello
+        return self.tool_tabs
+
+    @staticmethod
+    def _panel(widget_builder):
+        """Scheda con i controlli in alto e lo spazio vuoto in fondo."""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 10, 4, 4)
+        layout.setSpacing(8)
+        widget_builder(layout)
+        layout.addStretch(1)
+        return panel
+
+    def _apply_button(self):
+        """Un passaggio FFmpeg solo per ritaglio, scala, colore e audio.
+
+        Il pulsante è ripetuto nelle tre schede che lo alimentano: ricodificare
+        tre volte di fila per tre filtri sarebbe tre volte la perdita.
+        """
+        button = QPushButton("Apply transforms")
+        button.setToolTip("Applies Transform, Colour and Audio together, in a single pass.")
+        button.clicked.connect(self.transform)
+        return button
+
+    # ----------------------------------------------------------- schede
+
+    def _cut_panel(self):
+        def build(layout):
+            times = QGridLayout()
+            self.in_time = QLineEdit("00:00:00")
+            self.out_time = QLineEdit("00:00:10")
+            for field in (self.in_time, self.out_time):
+                field.setFont(theme.mono_font(10))
+            self.precise = QCheckBox("Precise cut (re-encode)")
+            self.precise.setChecked(True)
+            times.addWidget(QLabel("IN"), 0, 0)
+            times.addWidget(self.in_time, 0, 1)
+            times.addWidget(QLabel("OUT"), 1, 0)
+            times.addWidget(self.out_time, 1, 1)
+            times.addWidget(self.precise, 2, 0, 1, 2)
+            layout.addLayout(times)
+
+            keep = QPushButton("✂ Keep selection only")
+            keep.clicked.connect(self.cut)
+            drop = QPushButton("✀ Remove selection")
+            drop.setObjectName("danger")
+            drop.setToolTip("Drops the IN–OUT range and stitches the rest back together.")
+            drop.clicked.connect(self.remove_section)
+            layout.addWidget(keep)
+            layout.addWidget(drop)
+
+            layout.addWidget(self._section_label("Segments"))
+            self.segment_list = QListWidget()
+            self.segment_list.setFont(theme.mono_font(9))
+            self.segment_list.setMaximumHeight(120)
+            self.segment_list.setToolTip(
+                "Several ranges handled in one FFmpeg pass.\n"
+                "Overlapping ranges are merged, order does not matter."
+            )
+            layout.addWidget(self.segment_list)
+
+            row = QHBoxLayout()
+            add = QPushButton("+ Add IN–OUT")
+            add.clicked.connect(self.add_segment)
+            remove = QPushButton("Remove")
+            remove.clicked.connect(self.remove_segment)
+            clear = QPushButton("Clear")
+            clear.clicked.connect(self.clear_segments)
+            for widget in (add, remove, clear):
+                row.addWidget(widget)
+            layout.addLayout(row)
+
+            keep_all = QPushButton("✂ Keep every segment")
+            keep_all.clicked.connect(self.keep_segments)
+            drop_all = QPushButton("✀ Remove every segment")
+            drop_all.setObjectName("danger")
+            drop_all.clicked.connect(self.remove_segments)
+            layout.addWidget(keep_all)
+            layout.addWidget(drop_all)
+        return self._panel(build)
+
+    def _transform_panel(self):
+        def build(layout):
+            size = QGridLayout()
+            self.scale_width = QLineEdit()
+            self.scale_width.setPlaceholderText("e.g. 1280 or -1")
+            self.scale_height = QLineEdit()
+            self.scale_height.setPlaceholderText("e.g. 720 or -1")
+            self.rotate = QComboBox()
+            self.rotate.addItems(["none", "90", "180", "270"])
+            for row, (name, widget) in enumerate([
+                    ("Width", self.scale_width), ("Height", self.scale_height),
+                    ("Rotation", self.rotate)]):
+                size.addWidget(QLabel(name), row, 0)
+                size.addWidget(widget, row, 1)
+            layout.addLayout(size)
+
+            crop = QGroupBox("Crop")
+            crop.setToolTip("Applied before scaling: the crop is read on the source pixels.")
+            grid = QGridLayout(crop)
+            self.crop_x = QLineEdit()
+            self.crop_y = QLineEdit()
+            self.crop_w = QLineEdit()
+            self.crop_h = QLineEdit()
+            for field, hint in ((self.crop_x, "0"), (self.crop_y, "0"),
+                                (self.crop_w, "width"), (self.crop_h, "height")):
+                field.setPlaceholderText(hint)
+            for column, (name, widget) in enumerate([
+                    ("X", self.crop_x), ("Y", self.crop_y)]):
+                grid.addWidget(QLabel(name), 0, column * 2)
+                grid.addWidget(widget, 0, column * 2 + 1)
+            for column, (name, widget) in enumerate([
+                    ("W", self.crop_w), ("H", self.crop_h)]):
+                grid.addWidget(QLabel(name), 1, column * 2)
+                grid.addWidget(widget, 1, column * 2 + 1)
+            full = QPushButton("Whole frame")
+            full.setToolTip("Clears the crop: back to the full frame.")
+            full.clicked.connect(self.clear_crop)
+            grid.addWidget(full, 2, 0, 1, 4)
+            layout.addWidget(crop)
+
+            layout.addWidget(self._apply_button())
+        return self._panel(build)
+
+    def _colour_panel(self):
+        def build(layout):
+            grid = QGridLayout()
+            self.brightness = self._spin(-1.0, 1.0, 0.0, 0.05)
+            self.contrast = self._spin(-2.0, 4.0, 1.0, 0.05)
+            self.saturation = self._spin(0.0, 3.0, 1.0, 0.05)
+            self.gamma = self._spin(0.1, 10.0, 1.0, 0.05)
+            for row, (name, widget) in enumerate([
+                    ("Brightness", self.brightness), ("Contrast", self.contrast),
+                    ("Saturation", self.saturation), ("Gamma", self.gamma)]):
+                grid.addWidget(QLabel(name), row, 0)
+                grid.addWidget(widget, row, 1)
+            layout.addLayout(grid)
+
+            hint = QLabel("Neutral: brightness 0, the rest 1. Nothing is written "
+                          "to the command while a value sits at its neutral.")
+            hint.setWordWrap(True)
+            hint.setObjectName("sectionLabel")
+            layout.addWidget(hint)
+
+            neutral = QPushButton("Reset to neutral")
+            neutral.clicked.connect(self.reset_colour)
+            layout.addWidget(neutral)
+            layout.addWidget(self._apply_button())
+        return self._panel(build)
+
+    def _audio_panel(self):
+        def build(layout):
+            grid = QGridLayout()
+            self.volume = self._spin(0.0, 5.0, 1.0, 0.1)
+            self.fadein = QLineEdit()
+            self.fadein.setPlaceholderText("seconds")
+            self.fadeout = QLineEdit()
+            self.fadeout.setPlaceholderText("seconds")
+            for row, (name, widget) in enumerate([
+                    ("Volume", self.volume), ("Fade in (s)", self.fadein),
+                    ("Fade out (s)", self.fadeout)]):
+                grid.addWidget(QLabel(name), row, 0)
+                grid.addWidget(widget, row, 1)
+            layout.addLayout(grid)
+            layout.addWidget(self._apply_button())
+
+            layout.addWidget(self._section_label("Track"))
+            row = QHBoxLayout()
+            extract = QPushButton("Extract audio")
+            extract.clicked.connect(self.extract_audio)
+            replace = QPushButton("Replace audio track")
+            replace.clicked.connect(self.replace_audio)
+            row.addWidget(extract)
+            row.addWidget(replace)
+            layout.addLayout(row)
+        return self._panel(build)
+
+    def _export_panel(self):
+        def build(layout):
+            frame = QPushButton("📷 Save current frame…")
+            frame.setToolTip("Saves the frame the player is showing, or IN when stopped.")
+            frame.clicked.connect(self.save_frame)
+            layout.addWidget(frame)
+
+            speed = QGroupBox("Speed")
+            grid = QGridLayout(speed)
+            self.speed = self._spin(0.1, 10.0, 1.0, 0.25)
+            self.speed.setSuffix("×")
+            self.speed_audio = QCheckBox("Keep audio")
+            self.speed_audio.setChecked(True)
+            self.speed_audio.setToolTip(
+                "atempo stretches the audio without moving its pitch.\n"
+                "Off drops the track altogether."
+            )
+            grid.addWidget(QLabel("Factor"), 0, 0)
+            grid.addWidget(self.speed, 0, 1)
+            grid.addWidget(self.speed_audio, 1, 0, 1, 2)
+            apply_speed = QPushButton("Apply speed")
+            apply_speed.clicked.connect(self.change_speed)
+            grid.addWidget(apply_speed, 2, 0, 1, 2)
+            layout.addWidget(speed)
+
+            animation = QGroupBox("Animation (IN–OUT)")
+            grid = QGridLayout(animation)
+            self.anim_fps = QSpinBox()
+            self.anim_fps.setRange(1, 50)
+            self.anim_fps.setValue(12)
+            self.anim_width = QSpinBox()
+            self.anim_width.setRange(16, 1920)
+            self.anim_width.setSingleStep(16)
+            self.anim_width.setValue(480)
+            self.anim_width.setSuffix(" px")
+            grid.addWidget(QLabel("Frame rate"), 0, 0)
+            grid.addWidget(self.anim_fps, 0, 1)
+            grid.addWidget(QLabel("Width"), 1, 0)
+            grid.addWidget(self.anim_width, 1, 1)
+            export = QPushButton("Export GIF / WebP…")
+            export.setToolTip("The extension you pick decides the format.")
+            export.clicked.connect(self.export_animation)
+            grid.addWidget(export, 2, 0, 1, 2)
+            layout.addWidget(animation)
+        return self._panel(build)
+
+    @staticmethod
+    def _spin(low, high, value, step):
+        spin = QDoubleSpinBox()
+        spin.setRange(low, high)
+        spin.setValue(value)
+        spin.setSingleStep(step)
+        spin.setDecimals(2)
+        return spin
 
     def _edit_viewer(self):
         """Colonna destra: il video, la sua barra e i comandi che lo guidano."""
@@ -533,6 +719,12 @@ class MainWindow(QMainWindow):
         self.subs.setChecked(s.value("download/subs", False, type=bool))
         self.playlist.setChecked(s.value("download/playlist", False, type=bool))
         self.precise.setChecked(s.value("edit/precise", True, type=bool))
+        for key, widget in self._numeric_settings().items():
+            widget.setValue(s.value(key, widget.value(), type=type(widget.value())))
+        for key, field in self._crop_settings().items():
+            field.setText(s.value(key, ""))
+        self.speed_audio.setChecked(s.value("export/speed_audio", True, type=bool))
+        self.tool_tabs.setCurrentIndex(s.value("edit/tool_tab", 0, type=int))
         self.extra.setPlainText(s.value("advanced/extra", ""))
         stato = s.value("edit/splitter")
         if stato:
@@ -554,6 +746,12 @@ class MainWindow(QMainWindow):
         s.setValue("download/subs", self.subs.isChecked())
         s.setValue("download/playlist", self.playlist.isChecked())
         s.setValue("edit/precise", self.precise.isChecked())
+        for key, widget in self._numeric_settings().items():
+            s.setValue(key, widget.value())
+        for key, field in self._crop_settings().items():
+            s.setValue(key, field.text())
+        s.setValue("export/speed_audio", self.speed_audio.isChecked())
+        s.setValue("edit/tool_tab", self.tool_tabs.currentIndex())
         s.setValue("advanced/extra", self.extra.toPlainText())
         s.setValue("edit/splitter", self.editor_splitter.saveState())
         s.sync()
@@ -979,6 +1177,166 @@ class MainWindow(QMainWindow):
         self._refresh_queue()
         self.statusBar().showMessage("Queue stopped")
 
+    # ------------------------------------------------- parametri e schede
+
+    def _numeric_settings(self) -> dict:
+        return {"edit/brightness": self.brightness, "edit/contrast": self.contrast,
+                "edit/saturation": self.saturation, "edit/gamma": self.gamma,
+                "edit/volume": self.volume, "export/speed": self.speed,
+                "export/anim_fps": self.anim_fps, "export/anim_width": self.anim_width}
+
+    def _crop_settings(self) -> dict:
+        return {"edit/crop_x": self.crop_x, "edit/crop_y": self.crop_y,
+                "edit/crop_w": self.crop_w, "edit/crop_h": self.crop_h}
+
+    @safe_slot
+    def _save_tool_tab(self, index):
+        self.settings.setValue("edit/tool_tab", index)
+
+    def crop_values(self):
+        """(X, Y, W, H) se almeno un campo è compilato, altrimenti None."""
+        fields = (self.crop_x, self.crop_y, self.crop_w, self.crop_h)
+        values = tuple(field.text().strip() for field in fields)
+        return values if any(values) else None
+
+    def colour_values(self) -> dict:
+        """I quattro parametri di `eq`, come stringhe: il filtro decide da solo
+        quali sono neutri e vanno omessi."""
+        return {"brightness": str(self.brightness.value()),
+                "contrast": str(self.contrast.value()),
+                "saturation": str(self.saturation.value()),
+                "gamma": str(self.gamma.value())}
+
+    @safe_slot
+    def clear_crop(self):
+        for field in self._crop_settings().values():
+            field.clear()
+
+    @safe_slot
+    def reset_colour(self):
+        for widget, neutral in ((self.brightness, 0.0), (self.contrast, 1.0),
+                                (self.saturation, 1.0), (self.gamma, 1.0)):
+            widget.setValue(neutral)
+
+    # ------------------------------------------------- segmenti multipli
+
+    @safe_slot
+    def add_segment(self):
+        """L'intervallo IN–OUT corrente entra nella lista."""
+        try:
+            start = parse_timestamp(self.in_time.text())
+            end = parse_timestamp(self.out_time.text())
+        except FFmpegError as exc:
+            QMessageBox.warning(self, "ytEdit", str(exc))
+            return
+        if end <= start:
+            QMessageBox.warning(self, "ytEdit", "Invalid range: check IN and OUT.")
+            return
+        self.segments.append((start, end))
+        self._refresh_segments()
+        self.statusBar().showMessage(f"Segments: {len(self.segments)}")
+
+    @safe_slot
+    def remove_segment(self):
+        row = self.segment_list.currentRow()
+        if 0 <= row < len(self.segments):
+            self.segments.pop(row)
+            self._refresh_segments()
+
+    @safe_slot
+    def clear_segments(self):
+        self.segments.clear()
+        self._refresh_segments()
+
+    def _refresh_segments(self):
+        self.segment_list.clear()
+        for start, end in self.segments:
+            self.segment_list.addItem(QListWidgetItem(
+                f"{format_short(start)} → {format_short(end)}"
+                f"   {format_short(end - start)}"))
+        self.timeline.set_segments(self.segments)
+
+    def _segment_operation(self, build, suffix, operation):
+        """Parte comune a «tieni» e «rimuovi» su più intervalli."""
+        if not self.segments:
+            QMessageBox.warning(self, "ytEdit",
+                                "No segment in the list: add IN–OUT first.")
+            return
+        src = self.source_file()
+        if not src:
+            return
+        dst = self.output_path(suffix)
+        args = self._guard(lambda: build(src, dst, self.segments))
+        if args:
+            self.run_ffmpeg(args, total_duration=media_info(src).duration,
+                            output=dst, operation=operation)
+
+    @safe_slot
+    def keep_segments(self):
+        self._segment_operation(keep_segments_cmd, "_segments", "Keep segments")
+
+    @safe_slot
+    def remove_segments(self):
+        self._segment_operation(remove_segments_cmd, "_without_segments", "Remove segments")
+
+    # ------------------------------------------------ fotogramma e export
+
+    @safe_slot
+    def save_frame(self):
+        """Il fotogramma mostrato adesso, o quello di IN se il player è fermo."""
+        src = self.source_file()
+        if not src:
+            return
+        position = self.player.time_pos()
+        if position is None:
+            try:
+                position = parse_timestamp(self.in_time.text())
+            except FFmpegError:
+                position = 0.0
+        stem = f"{Path(src).stem}_{format_timestamp(position).replace(':', '-')}"
+        dst, _ = QFileDialog.getSaveFileName(
+            self, "Save frame", str(Path(src).with_name(stem + ".png")),
+            "PNG (*.png);;JPEG (*.jpg)")
+        if not dst:
+            return
+        args = self._guard(lambda: frame_cmd(src, dst, format_timestamp(position)))
+        if args:
+            self.run_ffmpeg(args, output=None, operation="Frame export")
+
+    @safe_slot
+    def change_speed(self):
+        src = self.source_file()
+        if not src:
+            return
+        factor = self.speed.value()
+        dst = self.output_path(f"_{factor:g}x".replace(".", "_"))
+        args = self._guard(lambda: speed_cmd(src, dst, factor, self.speed_audio.isChecked()))
+        if args:
+            # La barra misura il tempo del file in uscita, non di quello in entrata.
+            self.run_ffmpeg(args, total_duration=media_info(src).duration / factor,
+                            output=dst, operation="Speed change")
+
+    @safe_slot
+    def export_animation(self):
+        src = self.source_file()
+        if not src:
+            return
+        dst, _ = QFileDialog.getSaveFileName(
+            self, "Export animation", str(Path(src).with_suffix(".gif")),
+            "GIF (*.gif);;WebP (*.webp)")
+        if not dst:
+            return
+        args = self._guard(lambda: animation_cmd(
+            src, dst, self.in_time.text(), self.out_time.text(),
+            self.anim_fps.value(), self.anim_width.value()))
+        if not args:
+            return
+        try:
+            span = parse_timestamp(self.out_time.text()) - parse_timestamp(self.in_time.text())
+        except FFmpegError:
+            span = 0.0
+        self.run_ffmpeg(args, total_duration=span, output=None, operation="Animation export")
+
     # ------------------------------------------------------------- FFmpeg
 
     def _busy(self) -> bool:
@@ -1078,7 +1436,8 @@ class MainWindow(QMainWindow):
         dst = self.output_path("_edited")
         args = self._guard(lambda: transform_cmd(
             src, dst, self.scale_width.text(), self.scale_height.text(), self.rotate.currentText(),
-            str(self.volume.value()), self.fadein.text(), self.fadeout.text()))
+            str(self.volume.value()), self.fadein.text(), self.fadeout.text(),
+            crop=self.crop_values(), **self.colour_values()))
         if not args:
             return
         self.run_ffmpeg(args, total_duration=media_info(src).duration,
@@ -1226,7 +1585,8 @@ class MainWindow(QMainWindow):
                 ("transform", lambda: transform_cmd(
                     src, self.output_path("_edited"), self.scale_width.text(), self.scale_height.text(),
                     self.rotate.currentText(), str(self.volume.value()),
-                    self.fadein.text(), self.fadeout.text())),
+                    self.fadein.text(), self.fadeout.text(),
+                    crop=self.crop_values(), **self.colour_values())),
             ):
                 try:
                     blocks.append(f"# {title}\n" + self._render_command(build()))

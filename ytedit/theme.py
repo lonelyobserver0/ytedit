@@ -302,6 +302,8 @@ QTabBar::tab {{
 QTabBar::tab:hover {{ color: {p.mark}; }}
 QTabBar::tab:selected {{ color: {p.mark}; border-bottom: 2px solid {p.accent}; }}
 
+QTabWidget#tools QTabBar::tab {{ padding: 5px 9px; }}
+
 QCheckBox {{ spacing: 7px; }}
 QCheckBox::indicator {{
     width: 14px; height: 14px;

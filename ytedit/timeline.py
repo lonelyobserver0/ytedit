@@ -38,6 +38,7 @@ class Timeline(QWidget):
         self._position = 0.0
         self._in = 0.0
         self._out = 0.0
+        self._segments = []              # intervalli messi da parte, non attivi
         self._dragging = None            # "in" | "out" | "position"
 
     # ------------------------------------------------------------- stato
@@ -59,6 +60,14 @@ class Timeline(QWidget):
 
     def selection(self):
         return self._in, self._out
+
+    def segments(self):
+        return list(self._segments)
+
+    def set_segments(self, segments):
+        """Gli intervalli della lista, disegnati sotto la selezione attiva."""
+        self._segments = [(float(start), float(end)) for start, end in segments]
+        self.update()
 
     def set_selection(self, start, end):
         self._in, self._out = float(start or 0.0), float(end or 0.0)
@@ -168,6 +177,19 @@ class Timeline(QWidget):
                     painter.drawLine(int(x), int(track.top() + 4),
                                      int(x), int(track.bottom() - 4))
                     t += passo
+
+            # Gli intervalli messi da parte: stessa ambra, molto più spenta,
+            # così la selezione che si sta muovendo resta quella che si vede.
+            painter.setPen(Qt.NoPen)
+            for inizio_s, fine_s in self._segments:
+                a, b = self._x_for(inizio_s), self._x_for(fine_s)
+                fascia = QRectF(a, track.top() + 1, max(1.0, b - a), track.height() - 2)
+                painter.setBrush(QBrush(QColor(ambra.red(), ambra.green(), ambra.blue(), 38)))
+                painter.drawRect(fascia)
+                painter.setPen(QPen(QColor(ambra.red(), ambra.green(), ambra.blue(), 120), 1))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(fascia.adjusted(0.5, 0.5, -0.5, -0.5))
+                painter.setPen(Qt.NoPen)
 
             inizio, fine = self._x_for(self._in), self._x_for(self._out)
             # Il nastro: la parte selezionata, in ambra.

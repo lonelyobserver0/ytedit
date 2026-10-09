@@ -76,6 +76,13 @@ The **IN–OUT selection only** checkbox in the Download tab does the same thing
 from the Download button.
 
 **Editor**
+
+The left column is split into tabs — Cut, Transform, Colour, Audio, Export — so
+only the knobs you are using are on screen. Transform, Colour and Audio all feed
+the same **Apply transforms** button: crop, scale, rotation, colour correction
+and the audio filters go through FFmpeg in a single pass, instead of one
+re-encode each.
+
 - **built-in video player**: libmpv is rendered inside a Qt OpenGL widget, so
   the video stays in the window even on native Wayland (this is not mpv as an
   external process attached with `--wid`, which requires X11)
@@ -91,6 +98,20 @@ from the Download button.
 - two opposite actions on the selection: **keep the selection only**, or
   **remove the selection**, which drops the range and stitches the remaining
   parts back together in a single FFmpeg pass (`trim` + `concat`)
+- **several segments at once**: put ranges aside with **+ Add IN–OUT** and keep
+  or remove all of them in one pass. Overlapping ranges are merged and the order
+  does not matter; the segments show on the timeline in a dimmer amber, so the
+  range you are dragging stays the one you see
+- **crop**, applied before scaling, so the rectangle is read on the source pixels
+- **colour correction**: brightness, contrast, saturation, gamma. A value left at
+  its neutral is left out of the command entirely
+- **speed change** from 0.1× to 10×: `setpts` for the picture, a chain of
+  `atempo` for the sound, which stretches it without moving its pitch. The audio
+  can also be dropped
+- **save the current frame** as PNG or JPEG, taken from where the player is
+- **GIF / WebP export** of the IN–OUT range, with frame rate and width. The GIF
+  builds its own palette from the actual frames (`palettegen` + `paletteuse`)
+  rather than settling for the generic 256 colours
 - audio extraction, audio track replacement
 - scaling, rotation, volume, audio fade in/out
 
